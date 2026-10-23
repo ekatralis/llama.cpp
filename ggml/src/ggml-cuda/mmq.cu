@@ -221,6 +221,31 @@ void ggml_cuda_mul_mat_q(
                 ntiles_J_best = ntiles_x;
             }
         }
+
+        // GCN has no stream-k: if there are few tiles per CU (e.g. few src0 rows), take the J with
+        // the fewest rounds of tiles over the CUs, each round costing J plus a fixed amount for the src0 tile.
+        if (GGML_CUDA_CC_IS_GCN(cc) && !ids && J_best > 0) {
+            const int64_t nsm      = ggml_cuda_info().devices[id].nsm;
+            const auto    ntiles_j = [&](const ggml_cuda_mmq_config & config) {
+                return (ncols_opt + config.J - 1) / config.J * ((ne01 + config.I - 1) / config.I) * ne02 * ne03;
+            };
+
+            if (ntiles_j(ggml_cuda_mmq_get_config(src0->type, J_best, fallback, cc, prec_src1)) < 2*nsm) {
+                int64_t cost_best = INT64_MAX;
+                for (int J = 8; J <= 128; J += 8) {
+                    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
+                    if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) {
+                        continue;
+                    }
+                    const int64_t cost = (ntiles_j(config) + nsm - 1) / nsm * (config.J + 32);
+                    if (cost < cost_best) {
+                        J_best        = J;
+                        nthreads_best = config.nthreads;
+                        cost_best     = cost;
+                    }
+                }
+            }
+        }
     }
     GGML_ASSERT(J_best > 0);
 
