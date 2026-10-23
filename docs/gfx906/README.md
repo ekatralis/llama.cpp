@@ -264,6 +264,45 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
   shared memory) for dim 0 with src1 contiguous in dim 1 and src1->ne[0] >= 32: 131 us. The size
   limit keeps the 1-token case ([3,10240] + [1,10240]) on the old kernel (tiled was 9.5 -> 13.8 us).
 
+### Generation round 2 (2026-10-23): IQ3 MMVQ, no change kept
+
+Per-token profile (tg, 33 ms/token): MMVQ ~26.7 ms. IQ3_S 9.2 ms (~380 GB/s), IQ4_XS 8.4 ms
+(~590 GB/s), IQ3_XXS 2.6 ms, Q5_K 1.9 ms, IQ2_S 1.7 ms (~240 GB/s), Q4_K 1.2 ms;
+quantize_q8_1 1.7 ms (461 launches), rms_norm 1.3 ms. GPU is busy 32.5 of 33.5 ms per token,
+HIP graphs on or off give the same tg (30.4 vs 30.5): launch overhead is not the limit.
+
+Counters (`rocprofv3 --pmc VALUBusy MemUnitBusy MemUnitStalled` on the tg shapes):
+
+| type | MemUnitBusy (TA) | VALUBusy |
+|---|---:|---:|
+| IQ3_S | 58-71% | 51-66% |
+| IQ3_XXS | 52-63% | 55-71% |
+| IQ4_XS | 57-67% | 48-66% |
+| IQ2_S | 79-91% | 39-47% |
+| IQ2_XS | 88-90% | 52-61% |
+
+IQ3_S and IQ4_XS both process ~1e12 weights/s; IQ3 only looks slower in GB/s because it has
+fewer bits per weight. Neither unit is saturated for IQ3. IQ2_S/IQ2_XS are fetch bound
+(global grid lookups).
+
+Tried, no gain (all reverted):
+- v_perm sign mask (the compiler turns `(lsb << 8) - lsb` into a quarter rate v_mul_lo_u32):
+  same e2e and same microbench once the GPU state was stable. A first microbench baseline in
+  this round was ~10% slow (GPU state), which made this look like a 6-16% win. Repeat baselines.
+- (grid, negated grid) pairs in LDS so one v_perm applies the signs: -18 instr/iter, but the
+  doubled LDS grid made IQ3_S up to 20% slower.
+- Several row pairs per workgroup (grid copy once): 1/2/4 groups, no gain. A "no grid copy"
+  timing test looked 2x faster, but it was invalid: with LDS never written the compiler may drop
+  the LDS reads and dependent math.
+- 4 or 8 rows per workgroup: mixed (IQ3_XXS up to -18%, IQ3_S up to +10%).
+- `#pragma unroll 2` on the MMVQ k loop: 0-15% slower.
+- LDS grid for IQ2_XS (4 KiB): 17408x5120 -18%, 5120x17408 +7%; type is 0.3 ms/token, dropped.
+- LDS grid for IQ2_S (8 KiB): up to 1.9x slower (8 workgroups per CU).
+
+MTP speculative decoding (model has 1 nextn layer, `--spec-type draft-mtp`), llama-server,
+greedy, 256 tokens, two prompts: no MTP 28 t/s; draft max 1: 33-35; 2: 30-33; 3: 34-39 t/s
+(acceptance 69-83%).
+
 ### Output checks (2026-10-23)
 
 `/opt/gfx906-tools/kld-check.sh [ubatch]`: llama-perplexity KL divergence of the fork vs stock
