@@ -127,12 +127,23 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         for (int j0 = 0; j0 < J; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
 
+#if defined(GGML_USE_HIP)
+            // y is 16 byte aligned: 128 bit LDS reads, their 16 bit offset field also avoids per column address math
+            static_assert(VDR_Q8_0_Q8_1_MMQ == 8, "bad VDR");
+            const int4 * y4 = (const int4 *) &y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K];
+            const int4 u0 = y4[0];
+            const int4 u1 = y4[1];
+            const int u[VDR_Q8_0_Q8_1_MMQ] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+#else
+            const int * u = &y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K];
+#endif // defined(GGML_USE_HIP)
+
 #pragma unroll
             for (int i0 = 0; i0 < I; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMQ>
-                    (&x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K],
+                    (&x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], u,
                      x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + k0/QI8_0], y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)]);
             }
         }
