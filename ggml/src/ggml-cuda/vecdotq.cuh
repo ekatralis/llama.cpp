@@ -1270,9 +1270,17 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 #define VDR_IQ3_S_Q8_1_MMVQ 2
 #define VDR_IQ3_S_Q8_1_MMQ  2
 
+// Negate the bytes of v selected by the low 4 bits of s (bit i -> byte i).
+// All IQ grid bytes are in [1, 127], so v ^ 0xFF + 1 never carries into the next byte.
+static __device__ __forceinline__ int iq_grid_apply_signs4(const int v, const uint32_t s) {
+    const uint32_t lsb  = __umul24(s & 0x0F, 0x00204081) & 0x01010101;
+    const uint32_t mask = (lsb << 8) - lsb;
+    return (v ^ mask) + lsb;
+}
+
 // TODO: don't use lookup table for signs
-static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_grid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const uint32_t * __restrict__ grid) {
 
     const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
 
@@ -1288,14 +1296,20 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(
-            iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+            grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
+#if defined(GGML_USE_HIP)
+        const int grid_l = iq_grid_apply_signs4(grid_pos.x, signs_packed_32 >> (4*l0 + 0));
+        const int grid_h = iq_grid_apply_signs4(grid_pos.y, signs_packed_32 >> (4*l0 + 4));
+        GGML_UNUSED(signs_packed_8);
+#else
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
 
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif // defined(GGML_USE_HIP)
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1308,6 +1322,11 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
 
     const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
     return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_iq3_s_q8_1_grid(vbq, bq8_1, kbx, iqs, iq3s_grid);
 }
 
 #define VDR_IQ1_S_Q8_1_MMVQ 1

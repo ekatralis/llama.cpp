@@ -750,6 +750,20 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+    // gfx906 serves scattered global loads at ~1 cache line per clock, LDS is much faster for grid lookups
+#if defined(__gfx906__)
+    constexpr bool lds_grid = type == GGML_TYPE_IQ3_S;
+#else
+    constexpr bool lds_grid = false;
+#endif // defined(__gfx906__)
+    __shared__ uint32_t grid_lds[lds_grid ? 512 : 1];
+    if constexpr (lds_grid) {
+        for (int i = tid; i < 512; i += nwarps*warp_size) {
+            grid_lds[i] = iq3s_grid[i];
+        }
+        __syncthreads();
+    }
+
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -781,12 +795,22 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                if constexpr (lds_grid) {
+                    tmp[j][i] += vec_dot_iq3_s_q8_1_grid(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, grid_lds);
+                } else {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                }
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        if constexpr (lds_grid) {
+                            tmp_gate[j][i] += vec_dot_iq3_s_q8_1_grid(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, grid_lds);
+                        } else {
+                            tmp_gate[j][i] += vec_dot_q_cuda(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
