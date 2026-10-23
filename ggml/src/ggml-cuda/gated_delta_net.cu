@@ -72,10 +72,28 @@ gated_delta_net_cuda(const float * q,
         s_shard[r]  = curr_state[i];
     }
 
+    // k is needed first in each token and does not depend on the state: load it one token ahead
+    float k_reg[rows_per_lane];
+    if (n_tokens > 0) {
+        const float * k_0 = k + iq3 * sq3 + iq1 * sq1;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            k_reg[r] = k_0[r * lanes_per_col + lane_in_col];
+        }
+    }
+
     for (int t = 0; t < n_tokens; t++) {
         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+
+        float k_nxt[rows_per_lane];
+        if (t + 1 < n_tokens) {
+            const float * k_n = k + iq3 * sq3 + (t + 1) * sq2 + iq1 * sq1;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                k_nxt[r] = k_n[r * lanes_per_col + lane_in_col];
+            }
+        }
 
         const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
         const float * beta_t = beta + gb_offset;
@@ -83,13 +101,11 @@ gated_delta_net_cuda(const float * q,
 
         const float beta_val = *beta_t;
 
-        // Cache k and q in registers
-        float k_reg[rows_per_lane];
+        // Cache q in registers
         float q_reg[rows_per_lane];
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i = r * lanes_per_col + lane_in_col;
-            k_reg[r] = k_t[i];
             q_reg[r] = q_t[i];
         }
 
@@ -153,6 +169,11 @@ gated_delta_net_cuda(const float * q,
         }
 
         attn_data += S_v * H;
+
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            k_reg[r] = k_nxt[r];
+        }
 
         if constexpr (keep_rs_t) {
             // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
