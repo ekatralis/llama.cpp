@@ -869,6 +869,21 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
+#if defined(__gfx906__)
+// dp4a vec_dot variant that reads the y tile from VRAM with scalar loads, nullptr if there is none
+template <ggml_type type, int J, bool fallback>
+static constexpr __device__ ggml_cuda_mmq_vec_dot_t ggml_cuda_mmq_get_vec_dot_y_vram(const ggml_cuda_mmq_vec_dot_t vec_dot) {
+    return
+        vec_dot == ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a   <type, J, fallback> ? ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a   <type, J, fallback, true> :
+        vec_dot == ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback> ? ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback, true> :
+        vec_dot == ggml_cuda_mmq_vec_dot_q3_K_q8_1_dp4a   <type, J, fallback> ? ggml_cuda_mmq_vec_dot_q3_K_q8_1_dp4a   <type, J, fallback, true> :
+        vec_dot == ggml_cuda_mmq_vec_dot_q4_K_q8_1_dp4a   <type, J, fallback> ? ggml_cuda_mmq_vec_dot_q4_K_q8_1_dp4a   <type, J, fallback, true> :
+        vec_dot == ggml_cuda_mmq_vec_dot_q5_K_q8_1_dp4a   <type, J, fallback> ? ggml_cuda_mmq_vec_dot_q5_K_q8_1_dp4a   <type, J, fallback, true> :
+        vec_dot == ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a   <type, J, fallback> ? ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a   <type, J, fallback, true> :
+        nullptr;
+}
+#endif // defined(__gfx906__)
+
 template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
@@ -907,7 +922,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 #if defined(__gfx906__)
     // y for more than 8 columns per warp does not fit in SGPRs
-    constexpr bool y_vram = vec_dot == ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback> && J/nwarps <= 8;
+    constexpr ggml_cuda_mmq_vec_dot_t vec_dot_y_vram = ggml_cuda_mmq_get_vec_dot_y_vram<type, J, fallback>(vec_dot);
+    constexpr bool y_vram = vec_dot_y_vram != nullptr && J/nwarps <= 8;
 #else
     constexpr bool y_vram = false;
 #endif // defined(__gfx906__)
@@ -919,8 +935,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             // the y tile in VRAM has the same layout as in shared memory
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
             __syncthreads();
-            ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_vram<type, J, fallback>(tile_x, by0,                sum, 0);
-            ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_vram<type, J, fallback>(tile_x, by0 + ncols_y * sz, sum, MMQ_TILE_NE_K);
+            vec_dot_y_vram(tile_x, by0,                sum, 0);
+            vec_dot_y_vram(tile_x, by0 + ncols_y * sz, sum, MMQ_TILE_NE_K);
             __syncthreads();
             continue;
         }
