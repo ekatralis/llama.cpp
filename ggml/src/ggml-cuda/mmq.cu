@@ -230,7 +230,7 @@ void ggml_cuda_mul_mat_q(
                 return (ncols_opt + config.J - 1) / config.J * ((ne01 + config.I - 1) / config.I) * ne02 * ne03;
             };
 
-            if (ntiles_j(ggml_cuda_mmq_get_config(src0->type, J_best, fallback, cc, prec_src1)) < 2*nsm) {
+            if (ntiles_j(ggml_cuda_mmq_get_config(src0->type, J_best, fallback, cc, prec_src1)) < 3*nsm) {
                 int64_t cost_best = INT64_MAX;
                 for (int J = 8; J <= 128; J += 8) {
                     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
