@@ -255,6 +255,38 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
   vs previous commit: IQ2_S / IQ2_XS -29..-31%, Q3_K -40%, Q5_K -20%, Q4_K -14%,
   Q6_K -13% (standard 4096x14336 shape). Q2_K (irregular vec dot) not done.
 
+- Change 11 (`gated_delta_net.cu`): load k one token ahead (k is needed first in each token and
+  does not depend on the state). First try prefetched k, q, v, beta, g: VGPRs 40 -> 67, occupancy
+  6 -> 3, 32-head cases up to 16% slower. k only: 54 VGPRs, occupancy 4. This model (48 heads,
+  512 tokens): 1.99 -> 1.29 ms per layer; 4 heads -38..-41%; 32 heads -4..+4%.
+- Change 12 (`concat.cu`): `concat_non_cont` for the ssm_conv input ([3,10240] + transposed
+  [512,10240]) read src1 with a 40 KB stride: 678 us, 58 GB/s. New tiled kernel (32x32 tiles via
+  shared memory) for dim 0 with src1 contiguous in dim 1 and src1->ne[0] >= 32: 131 us. The size
+  limit keeps the 1-token case ([3,10240] + [1,10240]) on the old kernel (tiled was 9.5 -> 13.8 us).
+
+### Output checks (2026-10-23)
+
+`/opt/gfx906-tools/kld-check.sh [ubatch]`: llama-perplexity KL divergence of the fork vs stock
+upstream on ~900 KB of repo docs (`/opt/gfx906-tools/kld-text.txt`), c = 512.
+
+| comparison | mean KLD | max KLD | same top token | PPL ratio |
+|---|---:|---:|---:|---:|
+| fork vs stock, ubatch 512 (MMQ), 8 chunks | 0.000000 | 0.000059 | 100.0% | 1.000000 |
+| stock vs stock, ubatch 1 (noise floor) | 0.000000 | 0.000048 | 100.0% | 1.000000 |
+| fork vs stock, ubatch 1 (MMVQ), 2 chunks | 0.000341 | 0.003774 | 97.6% | 1.0012 +- 0.0012 |
+| stock ubatch 512 vs stock ubatch 1 | 0.000712 | 0.009195 | 97.3% | 1.0007 +- 0.0015 |
+| stock ubatch 4 vs stock ubatch 1 | 0.000312 | 0.004705 | 97.3% | - |
+
+- The prompt (MMQ) path is bit-exact vs stock. All IQ sign / LDS-grid changes are bit-exact too
+  (bisect: KLD unchanged across those commits).
+- The ubatch-1 difference comes only from the MMVQ launch shape (nwarps 2 -> 1; rows per block
+  does not matter): float summation order. Isolated, each batch-1 matmul has the same error vs CPU
+  with 1 or 2 warps (~2.5e-5 NMSE, from the q8_1 activation quantization). The size of the
+  difference is the same as stock's own difference between ubatch sizes, so it is not a bug.
+- `test-backend-ops --test-file` with per-test errors: `/opt/gfx906-tools/test-backend-ops-print-err.patch`
+  (adds `GFX906_PRINT_ERR=1`), parse with `/opt/gfx906-tools/errs.py`.
+- Greedy generation (200 tokens) is identical to stock for ~150 tokens, then a near-tie flips.
+
 ### Results so far (fa=1, llama-bench -r 3)
 
 | build | pp512 | tg128 | pp512 @ d8192 | tg128 @ d8192 |
@@ -267,6 +299,7 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
 | + MMQ 128 bit y reads, y from VRAM via SGPRs | 339.3 | 30.46 | 306.2 | 29.15 |
 | + IQ sign helper in MMQ loaders, MMQ J rebalance | 353.9 | 30.47 | 317.4 | 29.15 |
 | + y from VRAM for K-quant / q8_0_16 vec dots | 372.0 | 30.48 | 331.8 | 29.15 |
+| + GDN k prefetch, tiled transposed concat | 386.4 | 30.41 | 343.3 | 29.09 |
 
 Tests after each change: `test-backend-ops test -b ROCm0 -o MUL_MAT,MUL_MAT_ID` (3376/3376)
 and `--test-file ops/qwen38_tg_mm.txt` (43/43).
