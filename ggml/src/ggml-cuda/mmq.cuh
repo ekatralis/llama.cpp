@@ -228,6 +228,7 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-rdna3.cuh"
 #include "mmq-config-rdna3-5.cuh"
 #include "mmq-config-rdna4.cuh"
+#include "mmq-config-gfx906.cuh"
 
 
 #undef CASE
@@ -245,6 +246,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         }
         if (GGML_CUDA_CC_IS_RDNA3(cc)) {  // covers RDNA 3.0
             return ggml_cuda_mmq_get_config_rdna3(type, J, fallback);
+        }
+        if (cc == GGML_CUDA_CC_VEGA20) {
+            return ggml_cuda_mmq_get_config_gfx906(type, J, fallback);
         }
         return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
     }
@@ -270,6 +274,8 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
     return ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback);
 #elif defined(RDNA3)
     return ggml_cuda_mmq_get_config_rdna3(type, J, fallback);
+#elif defined(__gfx906__)
+    return ggml_cuda_mmq_get_config_gfx906(type, J, fallback);
 #else
     return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
 #endif // CDNA
@@ -951,7 +957,26 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+#if defined(__gfx906__)
+    // y for more than 8 columns per warp does not fit in SGPRs
+    constexpr bool y_vram = vec_dot == ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback> && J/nwarps <= 8;
+#else
+    constexpr bool y_vram = false;
+#endif // defined(__gfx906__)
+
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+#if defined(__gfx906__)
+        if constexpr (y_vram) {
+            // the y tile in VRAM has the same layout as in shared memory
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            __syncthreads();
+            ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_vram<type, J, fallback>(tile_x, by0,                sum, 0);
+            ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_vram<type, J, fallback>(tile_x, by0 + ncols_y * sz, sum, MMQ_TILE_NE_K);
+            __syncthreads();
+            continue;
+        }
+#endif // defined(__gfx906__)
         if constexpr (async_buffer_y) {
             const char * by0 = reinterpret_cast<const char *>(
                 y + ncols_y * (kb0 * qk / ne_block) * sz);
