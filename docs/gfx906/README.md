@@ -199,6 +199,17 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
   (no change), limiting k01 unroll (no change), 256 threads / occupancy 1 / I = 128 (all slower).
   Result: Q2_K 5120x12288 x 512: 33.1 ms -> 7.4 ms.
 
+- Change 5 (`mmq-config-gcn.cuh`): MMQ config sweep at J = 64 (nthreads x I x occupancy:
+  512/128/2 (old), 512/64/2, 256/64/2, 256/128/2, 256/128/1, 512/128/1).
+  IQ4_XS: 512/64/2 best, -2..-6% on 4 of 6 shapes, flat on the rest -> adopted.
+  IQ3_S: old config (512/128/2) is best. Occupancy 1 vs 2 makes no difference at 512 threads.
+- Sign helper in the IQ3_S MMQ tile loader: ~1% (noise). MMQ is bound by its dot loop, not by
+  tile loads. Not kept.
+- IQ4_XS MMQ inner loop (J = 64): 549 instructions, only 128 `v_dot4_i32_i8` (23%); 90 LDS reads,
+  76 `v_add_u32` (address math), 45 waits, ~50 for scale conversion. The odd x-tile row stride
+  (2*MMQ_TILE_NE_K + 1 ints, to avoid bank conflicts) blocks 64/128-bit LDS reads. This matches
+  the "~41% issue ceiling" another fork reported. Raising it needs an MMQ restructure for gfx906.
+
 ### Results so far (fa=1, llama-bench -r 3)
 
 | build | pp512 | tg128 | pp512 @ d8192 | tg128 @ d8192 |
@@ -207,6 +218,7 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
 | + VEGA20 MMVQ shape | 241.1 | 23.94 | 224.5 | 23.10 |
 | + IQ3_S LDS grid + sign math | 241.2 | 28.73 | 224.5 | 27.51 |
 | + IQ2/IQ3_XXS signs, LDS grids | 241.3 | 30.49 | 224.5 | 29.18 |
+| + Q2_K MMQ J cap, IQ4_XS MMQ I = 64 | 254.2 | 30.45 | 235.3 | 29.12 |
 
 Tests after each change: `test-backend-ops test -b ROCm0 -o MUL_MAT,MUL_MAT_ID` (3376/3376)
 and `--test-file ops/qwen38_tg_mm.txt` (43/43).
