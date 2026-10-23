@@ -905,8 +905,26 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+#if defined(__gfx906__)
+    // y for more than 8 columns per warp does not fit in SGPRs
+    constexpr bool y_vram = vec_dot == ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback> && J/nwarps <= 8;
+#else
+    constexpr bool y_vram = false;
+#endif // defined(__gfx906__)
+
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+#if defined(__gfx906__)
+        if constexpr (y_vram) {
+            // the y tile in VRAM has the same layout as in shared memory
+            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            __syncthreads();
+            ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_vram<type, J, fallback>(tile_x, by0,                sum, 0);
+            ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_vram<type, J, fallback>(tile_x, by0 + ncols_y * sz, sum, MMQ_TILE_NE_K);
+            __syncthreads();
+            continue;
+        }
+#endif // defined(__gfx906__)
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll

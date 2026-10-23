@@ -150,6 +150,50 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+#if defined(__gfx906__)
+// Same as ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a but y is the tile in VRAM, not in shared memory.
+// y is the same for all threads of a warp, so it is read with scalar loads instead of broadcast LDS reads.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_vram(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
+
+    typedef const __attribute__((address_space(4))) int   int_s;
+    typedef const __attribute__((address_space(4))) float float_s;
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + txs.qs;
+    int_s       * y_qs = (int_s       *) y + 4;
+    float_s     * y_df = (float_s     *) y;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = __builtin_amdgcn_readfirstlane(j0 + threadIdx.y);
+
+            int u[VDR_Q8_0_Q8_1_MMQ];
+#pragma unroll
+            for (int l = 0; l < VDR_Q8_0_Q8_1_MMQ; ++l) {
+                u[l] = y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K + l];
+            }
+            const float d_y = y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)];
+
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += warp_size) {
+                const int i = i0 + threadIdx.x;
+
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMQ>
+                    (&x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], u, x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + k0/QI8_0], d_y);
+            }
+        }
+    }
+}
+#endif // defined(__gfx906__)
+
 template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout>
 static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
