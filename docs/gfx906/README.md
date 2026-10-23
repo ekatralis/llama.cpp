@@ -240,6 +240,21 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
   on stock upstream f5027fb, built in the worktree `/opt/llama.cpp-stock` (kept as an A/B baseline,
   `build/` there has `test-backend-ops` and `llama-bench`).
 
+- Change 8 (`mmq-load-tiles.cuh`): `iq_grid_apply_signs4` in the IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+  IQ3_S MMQ tile loaders (HIP). Now that the dot loop is faster: -2..-3% for each IQ type.
+- Change 9 (`mmq.cu`): MMQ tile width (J) choice on GCN. GCN has no stream-k, so a 5120x48 Q8_0
+  matmul at n = 512 ran as 4 blocks on 60 CUs (512 us). If the usual J gives fewer than 3 tiles
+  per CU (dense only), pick the J that minimizes ceil(ntiles / nCU) * (J + 32).
+  A first version that always used this cost model made big IQ matmuls much slower (it picked
+  J values with untuned configs). Q8_0 5120x48: 543 -> 228 us; 5120x1024 K/V shapes: -20..-30%.
+- Change 10 (`mmq.cuh`, `mmq-vec-dot.cuh`, `mmq-config-gcn.cuh`): the VRAM y path generalized with a
+  `y_vram` template flag on the q8_0, q8_0_16, q3_K, q4_K, q5_K, q6_K dp4a vec dots (helpers
+  `mmq_y_col` / `mmq_y_regs`; without the flag the code is the same as before).
+  `ggml_cuda_mmq_get_vec_dot_y_vram` maps a vec dot to its VRAM variant (compile-time pointer
+  compare). Configs at J = 64 for Q3_K, Q4_K, Q5_K, Q6_K: 512 threads, I = 64 (8 columns per warp).
+  vs previous commit: IQ2_S / IQ2_XS -29..-31%, Q3_K -40%, Q5_K -20%, Q4_K -14%,
+  Q6_K -13% (standard 4096x14336 shape). Q2_K (irregular vec dot) not done.
+
 ### Results so far (fa=1, llama-bench -r 3)
 
 | build | pp512 | tg128 | pp512 @ d8192 | tg128 @ d8192 |
@@ -250,6 +265,8 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
 | + IQ2/IQ3_XXS signs, LDS grids | 241.3 | 30.49 | 224.5 | 29.18 |
 | + Q2_K MMQ J cap, IQ4_XS MMQ I = 64 | 254.2 | 30.45 | 235.3 | 29.12 |
 | + MMQ 128 bit y reads, y from VRAM via SGPRs | 339.3 | 30.46 | 306.2 | 29.15 |
+| + IQ sign helper in MMQ loaders, MMQ J rebalance | 353.9 | 30.47 | 317.4 | 29.15 |
+| + y from VRAM for K-quant / q8_0_16 vec dots | 372.0 | 30.48 | 331.8 | 29.15 |
 
 Tests after each change: `test-backend-ops test -b ROCm0 -o MUL_MAT,MUL_MAT_ID` (3376/3376)
 and `--test-file ops/qwen38_tg_mm.txt` (43/43).
