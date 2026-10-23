@@ -26,6 +26,7 @@ All installed with `apt-get install` as root on 2026-10-23.
 | `linux-tools-common`, `linux-tools-generic` | `perf` for CPU-side profiling (built for 6.8.0-147, may warn on the running 6.8.0-138 kernel) |
 | `htop`, `wget` | monitoring, downloads |
 | `python3-numpy`, `python3-yaml` | needed by `gguf-py` to inspect model files |
+| `jq` | JSON parsing for the Claude Code status line script (not used by the fork) |
 
 Repo-local git identity set with `git config user.name/user.email` (not global).
 
@@ -51,6 +52,10 @@ Helper tools in `/opt/gfx906-tools/`:
 | `mmvq-bench.sh [type regex]` | `test-backend-ops perf` on the batch-1 matmuls, prints `type KxN us GB/s` |
 | `sweep-mmvq.sh NW RPB [regex]` | sets the temporary mmvq knobs, rebuilds `test-backend-ops`, runs `mmvq-bench.sh` |
 | `kres.sh <src> [regex]` + `kres_parse.py` | VGPR / spill / occupancy per kernel via `-Rpass-analysis=kernel-resource-usage` |
+| `kasm.sh <src> <out.s>` + `kloop.py <out.s> <mangled name>` | dump gfx906 assembly, count instruction mix of a kernel's inner loops |
+| `mmq-bench.sh [type]` | `test-backend-ops perf` on the batch-512 matmuls (MMQ), prints `type KxN us` |
+| `sweep-mmq.sh <CFG_TYPE> <test type> NTHREADS OCC I` | edit the GCN MMQ config at J = 64 for one type, rebuild, run `mmq-bench.sh` |
+| `bw/bw.hip` | peak HBM read bandwidth test (`hipcc -O3 --offload-arch=gfx906`) |
 
 Profiling a generation run:
 `rocprofv3 --kernel-trace -d DIR -o tg -- llama-bench -m MODEL -fa 1 -p 0 -n 64 -r 1`,
@@ -107,6 +112,19 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
   for K-quants (claims ~89% vs ~58% of HBM BW), DPP warp reductions, LDS gated delta net,
   MMQ LDS layout, "IQ3_S repack" (details not checked yet).
 
+- `milpster/gfx906-llama-cpp` (read 2026-10-23, shallow clone, not built): production fork
+  for 2x Radeon VII + RTX 3080 (Vulkan), ROCm 6.1, Q6_K models, long context + speculative
+  decoding. No IQ-grid or MMVQ launch-shape work. Their own A/B: fork is 28% slower than
+  mainline for deep TG. Useful as a list of measured negatives on gfx906:
+  - MMQ Y-tile L2 prefetch (ported from iacopPBK): -7.5% PP.
+  - 5 MMQ inner-loop restructures: no gain ("~41% issue ceiling is structural").
+  - Chunked (WY) gated delta net prefill: 0.5x vs recurrent (no matrix units).
+  - fattn tile scheduling / geometry / XOR swizzle probes: -0.5 to -5.8%.
+  - Pointers worth a look later: iacopPBK/llama.cpp-gfx906 (`ggml-cuda/gfx906/`: DPP warp
+    reductions, q8 activation cache, fused norm), mixa3607 `amd-memory-tweak` (HBM2 timing
+    tuning, needs root, stability risk).
+  - Claims ROCm 6.1 is "the measured optimum for gfx906", with no numbers given.
+
 ## Log
 
 ### 2026-10-23
@@ -150,6 +168,37 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
   - More rows per block with the LDS grid (4, 8) is slower, so the per-block table copy is cheap.
   - Result: tg128 23.94 -> 28.73 t/s, tg128 @ d8192 23.10 -> 27.51. pp unchanged.
 
+- Change 3 (`vecdotq.cuh`, `mmvq.cu`): same treatment for the other IQ grid types.
+  - Sign helper moved next to `unpack_ksigns` and used for IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS
+    (HIP only; the 7-bit ksigns + parity byte maps to the same nibble-per-4-bytes layout).
+  - LDS grid generalized: `mmvq_lds_grid_size(type)` (gfx906 only) + `get_vec_dot_q_grid_cuda` +
+    `get_iq_grid`. Enabled for IQ2_XXS (2 KB), IQ3_XXS (1 KB), IQ3_S (2 KB). `__align__(16)` for
+    the 8-byte IQ2 grid reads.
+  - IQ2_S (8 KB grid) and IQ2_XS (4 KB) are faster with global grids + sign helper only: with
+    K = 5120 the per-block grid copy outweighs the ~3 KB of weights a block reads.
+  - IQ3_XXS 17408x5120: 152.5 -> 81 us. IQ2_S 139.6 -> 120.6 us. IQ2_XS 120.9 -> 105.8 us.
+  - Result: tg128 28.73 -> 30.49 t/s, tg128 @ d8192 27.51 -> 29.18.
+- Peak HBM read bandwidth measured with a simple uint4 read kernel (`/opt/gfx906-tools/bw/bw.hip`):
+  ~865 GB/s. So the floor for 12.6 GB of weights per token is ~14.5 ms (~69 t/s).
+  At 30.5 t/s (~32.5 ms/token): IQ4_XS runs at ~75% of peak, IQ3_S ~50%, IQ3_XXS ~45%.
+- Tried and rejected for MMVQ (all measured with `mmvq-bench.sh`):
+  - `v_perm_b32` instead of `lsb*255` for the sign mask: removes 16 `v_mul_lo_u32` per loop,
+    no measurable change. IQ3_S loop is now ~237 instructions per 64 weights (was ~430).
+  - VDR 4 for IQ3_S (each thread does two 2-int chunks): 83 -> 114 us. More threads in flight win.
+  - Launch shape re-sweep for LDS-grid types (1x2, 2x1, 2x2, 4x1, 4x2, 2x4): 1x2 still best.
+  - 2 KB LDS sign-mask table for IQ3_S (256 x uint2, built per block): long rows 83 -> 79 us,
+    K = 5120 rows 91 -> 107 us. Net loss for this model.
+  - Half warp per row (so K = 20/24/68 superblocks have no idle tail): IQ3_XXS -10..13%, but
+    K-quants +7..23% slower (the two rows no longer share y loads). Net loss.
+- Prompt processing profile (pp512, ~2.09 s): MMQ IQ4_XS 619 ms, IQ3_S 615 ms, IQ3_XXS 175 ms,
+  Q2_K 99 ms (only 3 tensors), IQ2_S 99 ms, gated delta net 91 ms, Q4_K 78 ms, Q3_K 66 ms.
+  All MMQ types run at ~14-15 TOPS (~28% of dp4a peak), with or without grid lookups.
+- Change 4 (`mmq-config-gcn.cuh`): Q2_K MMQ tile width capped at 40 on GCN (removed the J = 48
+  and J = 64 entries). Under ROCm 7.14 these spill up to ~150 VGPRs: the 512-thread config with
+  occupancy 2 caps each thread at 128 VGPRs. Tried first and rejected: dropping the `y_df` array
+  (no change), limiting k01 unroll (no change), 256 threads / occupancy 1 / I = 128 (all slower).
+  Result: Q2_K 5120x12288 x 512: 33.1 ms -> 7.4 ms.
+
 ### Results so far (fa=1, llama-bench -r 3)
 
 | build | pp512 | tg128 | pp512 @ d8192 | tg128 @ d8192 |
@@ -157,6 +206,7 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
 | upstream f5027fb | 241.0 | 22.16 | 223.4 | 21.45 |
 | + VEGA20 MMVQ shape | 241.1 | 23.94 | 224.5 | 23.10 |
 | + IQ3_S LDS grid + sign math | 241.2 | 28.73 | 224.5 | 27.51 |
+| + IQ2/IQ3_XXS signs, LDS grids | 241.3 | 30.49 | 224.5 | 29.18 |
 
 Tests after each change: `test-backend-ops test -b ROCm0 -o MUL_MAT,MUL_MAT_ID` (3376/3376)
 and `--test-file ops/qwen38_tg_mm.txt` (43/43).
