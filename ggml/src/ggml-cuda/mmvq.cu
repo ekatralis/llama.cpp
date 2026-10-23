@@ -66,6 +66,42 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
     }
 }
 
+typedef float (*vec_dot_q_grid_cuda_t)(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const uint32_t * __restrict__ grid);
+
+// IQ grids that are copied to LDS, size in 32 bit words. gfx906 serves scattered global loads at ~1 cache line per clock.
+static constexpr __device__ int mmvq_lds_grid_size(ggml_type type) {
+#if defined(__gfx906__)
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: return 2*256;
+        case GGML_TYPE_IQ3_XXS: return 256;
+        case GGML_TYPE_IQ3_S:   return 512;
+        default:                return 0;
+    }
+#else
+    GGML_UNUSED(type);
+    return 0;
+#endif // defined(__gfx906__)
+}
+
+static constexpr __device__ vec_dot_q_grid_cuda_t get_vec_dot_q_grid_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1_grid;
+        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1_grid;
+        case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1_grid;
+        default:                return nullptr;
+    }
+}
+
+static __device__ __forceinline__ const uint32_t * get_iq_grid(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: return (const uint32_t *) iq2xxs_grid;
+        case GGML_TYPE_IQ3_XXS: return iq3xxs_grid;
+        case GGML_TYPE_IQ3_S:   return iq3s_grid;
+        default:                return nullptr;
+    }
+}
+
 static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
@@ -750,16 +786,14 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    // gfx906 serves scattered global loads at ~1 cache line per clock, LDS is much faster for grid lookups
-#if defined(__gfx906__)
-    constexpr bool lds_grid = type == GGML_TYPE_IQ3_S;
-#else
-    constexpr bool lds_grid = false;
-#endif // defined(__gfx906__)
-    __shared__ uint32_t grid_lds[lds_grid ? 512 : 1];
+    constexpr int  grid_size = mmvq_lds_grid_size(type);
+    constexpr bool lds_grid  = grid_size > 0;
+    constexpr vec_dot_q_grid_cuda_t vec_dot_q_grid_cuda = get_vec_dot_q_grid_cuda(type);
+    __shared__ __align__(16) uint32_t grid_lds[lds_grid ? grid_size : 1];
     if constexpr (lds_grid) {
-        for (int i = tid; i < 512; i += nwarps*warp_size) {
-            grid_lds[i] = iq3s_grid[i];
+        const uint32_t * grid = get_iq_grid(type);
+        for (int i = tid; i < grid_size; i += nwarps*warp_size) {
+            grid_lds[i] = grid[i];
         }
         __syncthreads();
     }
@@ -796,7 +830,7 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 if constexpr (lds_grid) {
-                    tmp[j][i] += vec_dot_iq3_s_q8_1_grid(
+                    tmp[j][i] += vec_dot_q_grid_cuda(
                         vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, grid_lds);
                 } else {
                     tmp[j][i] += vec_dot_q_cuda(
@@ -805,7 +839,7 @@ static __global__ void mul_mat_vec_q(
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         if constexpr (lds_grid) {
-                            tmp_gate[j][i] += vec_dot_iq3_s_q8_1_grid(
+                            tmp_gate[j][i] += vec_dot_q_grid_cuda(
                                 vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, grid_lds);
                         } else {
                             tmp_gate[j][i] += vec_dot_q_cuda(
