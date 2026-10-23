@@ -210,6 +210,36 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
   (2*MMQ_TILE_NE_K + 1 ints, to avoid bank conflicts) blocks 64/128-bit LDS reads. This matches
   the "~41% issue ceiling" another fork reported. Raising it needs an MMQ restructure for gfx906.
 
+- Change 6 (`mmq-vec-dot.cuh`): 128 bit LDS reads for y in the q8_0 dp4a vec dot (HIP). y is
+  16 byte aligned (column stride 144 B). `ds_read2_b32` offsets (max 1020 B) cannot span the
+  1152 B per-warp column step, so each column needed address adds; `ds_read_b128` has a 16 bit
+  offset. Loop 549 -> 467 instructions, `v_add_u32` 76 -> 18. IQ3_S -12.7%, IQ4_XS -6.7%.
+  Tried after: preload y for all 8 columns (spills, 3-4x slower), double-buffer the next column
+  (IQ3_S -3%, IQ4_XS +1%; not kept).
+- Diagnosis: y is the same for every lane of a warp (one column per warp), so each 128 bit LDS
+  read is a 64-lane broadcast that still costs ~8 LDS clocks. Per k01 step a wave spends ~160 LDS
+  clocks vs 256 SIMD clocks of dp4a, and 4 SIMDs share one LDS: LDS bound by ~2.5x.
+  Check: replacing the y reads with constants (wrong results) made IQ4_XS 31% faster.
+- Change 7 (`mmq.cuh`, `mmq-vec-dot.cuh`, `mmq-config-gcn.cuh`): on gfx906, for types whose dp4a
+  vec dot is `ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a` (compile-time function pointer compare), skip
+  the y copy to LDS and read y directly from VRAM in `ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_vram`.
+  The column index goes through `__builtin_amdgcn_readfirstlane` and y is read through an
+  `address_space(4)` pointer, so the compiler emits `s_load_dwordx8` and dp4a takes y from SGPRs.
+  The global y tile has the same layout as the LDS copy (the copy is linear).
+  - Limited to `J/nwarps <= 8`: Q8_0 uses J = 128 at n = 512 (16 columns per warp = 128 SGPRs
+    for y) and was 43% slower with the VRAM path.
+  - With y out of LDS, I = 64 beats I = 128 at J = 64: set for Q5_0, IQ2_XXS, IQ2_XS, IQ2_S,
+    IQ3_XXS, IQ3_S, IQ4_NL (IQ2_XS/IQ2_S use the q8_0_16 vec dot, not the VRAM path, but also
+    gain 6-11% from I = 64). Q8_0 stays at I = 128.
+  - vs previous commit at n = 512: IQ3_S, IQ3_XXS, IQ4_XS, IQ4_NL, IQ2_XXS, Q5_0 -22..-32%;
+    IQ2_S / IQ2_XS -6..-11%; K-quants, Q4_0, IQ1_S, Q8_0 unchanged.
+  - Upstream note: the I = 64 config rows are in the shared GCN table; on other GCN chips (no
+    VRAM y path) I = 64 is slower. An upstream version must gate these rows to gfx906.
+- Test baseline: `test-backend-ops --test-file ops/qwen38.txt` fails the same 7 non-matmul cases
+  (SCALE, CPY, GET_ROWS, GATED_DELTA_NET; NaN/inf in both CPU and GPU from random state inputs)
+  on stock upstream f5027fb, built in the worktree `/opt/llama.cpp-stock` (kept as an A/B baseline,
+  `build/` there has `test-backend-ops` and `llama-bench`).
+
 ### Results so far (fa=1, llama-bench -r 3)
 
 | build | pp512 | tg128 | pp512 @ d8192 | tg128 @ d8192 |
@@ -219,6 +249,7 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
 | + IQ3_S LDS grid + sign math | 241.2 | 28.73 | 224.5 | 27.51 |
 | + IQ2/IQ3_XXS signs, LDS grids | 241.3 | 30.49 | 224.5 | 29.18 |
 | + Q2_K MMQ J cap, IQ4_XS MMQ I = 64 | 254.2 | 30.45 | 235.3 | 29.12 |
+| + MMQ 128 bit y reads, y from VRAM via SGPRs | 339.3 | 30.46 | 306.2 | 29.15 |
 
 Tests after each change: `test-backend-ops test -b ROCm0 -o MUL_MAT,MUL_MAT_ID` (3376/3376)
 and `--test-file ops/qwen38_tg_mm.txt` (43/43).
