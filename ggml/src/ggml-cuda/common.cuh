@@ -1563,6 +1563,25 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // MMVQ: q8_1 copy of the last src1, reused by later matmuls with the same src1 in one graph
+    // (e.g. the q/k/v projections). Held only during a graph compute, on stream 0.
+    struct mmvq_q8_1_cache_t {
+        const ggml_tensor * src1 = nullptr;
+        const void *        data = nullptr;
+        int64_t             ne[GGML_MAX_DIMS] = {0};
+        size_t              nb[GGML_MAX_DIMS] = {0};
+        void *              ptr    = nullptr;
+        size_t              size   = 0;
+        int                 device = -1;
+    } mmvq_q8_1_cache;
+
+    void mmvq_q8_1_cache_release() {
+        if (mmvq_q8_1_cache.ptr != nullptr) {
+            pools[mmvq_q8_1_cache.device][0]->free(mmvq_q8_1_cache.ptr, mmvq_q8_1_cache.size);
+        }
+        mmvq_q8_1_cache = {};
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {
