@@ -59,8 +59,9 @@ Helper tools in `/opt/gfx906-tools/`:
 | `mmq-bench.sh [type]` | `test-backend-ops perf` on the batch-512 matmuls (MMQ), prints `type KxN us` |
 | `sweep-mmq.sh <CFG_TYPE> <test type> NTHREADS OCC I` | edit the GCN MMQ config at J = 64 for one type, rebuild, run `mmq-bench.sh` |
 | `bw/bw.hip` | peak HBM read bandwidth test (`hipcc -O3 --offload-arch=gfx906`) |
+| `gpu.sh <cmd...>` | runs a command holding the exclusive GPU lock (`flock`); every GPU job goes through it when two agents share the card |
 | `mk-ncols-ops.py <in> <out> n...` | MUL_MAT op file with n columns from the batch-1 ops (env `TYPES`, `SHAPES` filter) |
-| `mmvq-ncols-bench.sh [regex] [ns]` | matmul time per column count, e.g. `n1= n2= n3= n4=` per shape (env `TYPES`, `SHAPES`) |
+| `mmvq-ncols-bench.sh [regex] [ns]` | matmul time per column count, e.g. `n1= n2= n3= n4=` per shape (env `TYPES`, `SHAPES`, `BIN` = build bin dir) |
 | `mtp-test.sh <label> [server args]` | llama-server t/s and draft acceptance on two greedy prompts |
 | `srvprof.py <rocpd db>` | busy / idle / gaps / kernel mix of a profiled llama-server run (raw rocpd tables) |
 | `mmstats.py <rocpd db> <n tokens>` | matvec time per (type, columns, kernel variant, launch blocks) from a generation profile |
@@ -373,6 +374,59 @@ then in mmvq.cu: `mul_mat_vec_q_hw` takes 1-4 columns.
 Q8_0 48 rows (alpha / beta, 96 x 12 us) ~1.2, Q5_K ~0.7, IQ2_XS / IQ2_XXS / Q2_K ~1.1.
 Split paths for IQ2_S and the K-quants might save ~1.5 ms per pass.
 
+### Multi-column MMVQ for IQ2 / K-quants, delta-net alpha / beta in one launch (2026-10-24, 009bc7d, e192e1e)
+
+Starting point (3-token pass, rocprofv3, `llama-bench -p 3 -n 0 -r 20`): GPU time 37.93 ms, matvec
+30.78 ms, ~8.3 ms of it in types still on the ysh kernel: IQ2_S 2.1, Q4_K 1.8, Q3_K 1.3, Q8_0
+alpha / beta 1.15 (96 launches x 12 us), Q5_K 0.7, IQ2_XS / Q2_K / IQ2_XXS 1.2.
+
+009bc7d, split load / math paths for IQ2_XXS, IQ2_XS, IQ2_S, Q2_K, Q3_K, Q5_K:
+- The split interface now has a per-type y struct and loader (`ys`, `load_y`): the IQ types read one
+  full q8_1 block, Q2_K / Q3_K 2 ints from each of 4 blocks, Q5_K 2 ints from each of 2 blocks.
+  The Q5_K header (dm + scales, 16 bytes) is one 128 bit load.
+- First version: IQ2_XXS +28..41%, Q3_K gate/up +11..31%, Q2_K +17..20%, Q5_K output head +12..16%,
+  but IQ2_S / IQ2_XS -15..26% vs ysh. Those two still read their grids (4 / 8 KB) from global
+  memory; with the grids in LDS (`grid_size` / `grid()` per split type) they are faster than ysh.
+- Launch config sweep (temporary env hook, 10 configs x 7 types x 2-4 columns): most differences
+  within 3%. Kept: Q2_K / Q3_K with 2 waves, 4 rows per half wave at 2 columns, 3 at 3 columns
+  (Q3_K +12 / +9%, Q2_K 3 columns +19%). Configs with 4 waves at 3-4 waves/EU spill for Q2_K / Q3_K.
+- Dropped after the in-model profile: Q4_K (slower than ysh on every model shape, e.g. 5120 rows
+  59.5 -> 68 us at 3 columns) and Q5_K below 16384 rows (88 -> 93 us). Lesson: the sweep compared
+  configs with each other, not with ysh; check against the old kernel per shape.
+- In model, 3 columns: IQ2_S 17408 rows 148 -> 107 us, IQ2_XS 146 -> 105, Q3_K 170 -> 115 and
+  89 -> 78, Q2_K 121 -> 86. Matvec 30.78 -> 29.82 ms, GPU time 37.93 -> 37.03 ms per pass.
+
+e192e1e, delta-net alpha / beta pair:
+- Graph order per layer: alpha mul_mat, reshape, add(dt), softplus, mul(a), reshape, beta mul_mat,
+  reshape, sigmoid. Both are 48 x 5120 Q8_0 on the same activation. The matcher takes the 9 nodes;
+  the kernel runs one block per row of both matrices (96 blocks of 4 waves splitting K) and applies
+  the epilogues, for 1-4 tokens. Before: 2 launches of 9.5-12 us (6 blocks each, the GPU mostly
+  idle) plus, above 1 token, the 4 elementwise ops.
+- The first matcher assumed beta first (and the first test built the graph that way, so it passed
+  while the model never fused). The profile showed 96 Q8_0 calls still there; the test now builds
+  the model's order. Check that a fusion fires in the model profile, not only in the test.
+- 48 x 6.4 us per pass, 240 fewer kernels per 3-token pass; GPU time 37.03 -> 35.35 ms.
+  tg128 35.9 -> 36.8 t/s (the 1-token path also uses it). Off with `GGML_CUDA_NO_GDN_PAIR=1`.
+- Test: `test-backend-ops -o GDN_BETA_ALPHA` (Q8_0 fused 1-4 tokens, 5 tokens and Q4_0 unfused).
+
+Results (both commits):
+
+| | before (f21cdbd) | after (e192e1e) |
+|---|---:|---:|
+| 2 / 3 / 4-token pass (llama-bench -p N, -r 10) | 35.6 / 39.3 / 45.6 ms | 34.4 / 37.4 / 43.5 ms |
+| tg128 / tg128 @ d8192 | 36.1 / 34.2 | 36.9 / 34.7 |
+| llama-server, no MTP | 35.5 / 35.4 t/s | 36.2 / 36.3 t/s |
+| llama-server, MTP draft 2 | 54.2 / 51.2 t/s | 58.8 / 55.2 t/s |
+| llama-server, MTP draft 3 | 52.3 / 47.1 t/s | 56.6 / 51.4 t/s |
+
+pp512 385 / 343 @ d8192 (unchanged). llama-bench at 2-4 tokens varies by +-10 t/s; the rocprofv3 GPU
+time per pass is the steadier measure. Tests: MUL_MAT 2445/2445, MUL_MAT_VEC_FUSION 1369/1369,
+`ops/qwen38_ncols_mm.txt` 129/129, GDN_BETA_ALPHA 12/12, full suite only TOPK_MOE (78, flaky as stock).
+
+Remaining in the 3-token pass: Q4_K ~1.65 ms and Q5_K below 16384 rows ~0.7 ms on ysh, Q5_K output
+head 1.15 ms (1 column there, ~770 GB/s, near the limit). Small fusions not done yet: the q / k L2
+norms into the delta-net kernel, ssm_conv into the conv-state concat, the gated norm.
+
 ### Output reference points (vs stock upstream f5027fb)
 
 Measured with `kld-check.sh` (KL divergence of the logits vs stock; ubatch 512 = prompt kernels,
@@ -384,6 +438,7 @@ Measured with `kld-check.sh` (KL divergence of the logits vs stock; ubatch 512 =
 | a25d385 .. 642a6b6 | same as stock (KLD 0, max = stock run-to-run noise) | differs: KLD 0.000341, same top 97.6% |
 | cf35d3b .. | same as stock (rechecked at 97d07dd) | differs: KLD 0.000384, same top 97.8% |
 | e64e5f4 .. | same as stock | ubatch 1 as cf35d3b; ubatch 3 / 4: KLD 0.000348 / 0.000328 |
+| 009bc7d, e192e1e .. | same as stock (rechecked at e192e1e) | ubatch 1 / 3 / 4: KLD 0.000298 / 0.000301 / 0.000299, same top 97.8-98.6% |
 
 - Generation output has not been bit-identical to stock since the first fork commit a25d385
   (batch-1 MMVQ launch shape 2 -> 1 warps changes the float summation order). The size is the same
@@ -394,6 +449,8 @@ Measured with `kld-check.sh` (KL divergence of the logits vs stock; ubatch 512 =
   `GGML_CUDA_NO_MMVQ_HW=1` restores the 642a6b6 results. ubatch 4 results did not change.
 - e64e5f4 (half-wave MMVQ for 2-4 columns) changes the multi-token results (ubatch 2-4, MTP
   verify); ubatch 4 KLD vs stock 0.000323 -> 0.000328. Also off with `GGML_CUDA_NO_MMVQ_HW=1`.
+- 009bc7d (IQ2 / K-quant multi-column paths) changes ubatch 2-4; e192e1e (alpha / beta pair, split K
+  summation) changes ubatch 1-4 (`GGML_CUDA_NO_GDN_PAIR=1` turns it off). Measured together.
 
 ## Log
 
@@ -609,6 +666,7 @@ upstream on ~900 KB of repo docs (`/opt/gfx906-tools/kld-text.txt`), c = 512.
 | + IQ sign helper in MMQ loaders, MMQ J rebalance | 353.9 | 30.47 | 317.4 | 29.15 |
 | + y from VRAM for K-quant / q8_0_16 vec dots | 372.0 | 30.48 | 331.8 | 29.15 |
 | + GDN k prefetch, tiled transposed concat | 386.4 | 30.41 | 343.3 | 29.09 |
+| branch gfx906-qwen38 at e192e1e (fusions, half-wave MMVQ, alpha / beta pair) | 385.3 | 36.86 | 342.6 | 34.73 |
 
 Tests after each change: `test-backend-ops test -b ROCm0 -o MUL_MAT,MUL_MAT_ID` (3376/3376)
 and `--test-file ops/qwen38_tg_mm.txt` (43/43).
