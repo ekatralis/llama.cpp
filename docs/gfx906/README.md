@@ -25,10 +25,11 @@ All installed with `apt-get install` as root on 2026-10-23.
 |---|---|
 | `ninja-build` | faster incremental builds |
 | `ccache` | cache compiled objects across rebuilds |
-| `linux-tools-common`, `linux-tools-generic` | `perf` for CPU-side profiling (built for 6.8.0-147, may warn on the running 6.8.0-138 kernel) |
+| `linux-tools-common`, `linux-tools-generic` | `perf` for CPU-side profiling (built for 6.8.0-147; the `perf` wrapper refuses the running 6.8.0-138 kernel, call `/usr/lib/linux-tools/6.8.0-147-generic/perf`; `perf record` is blocked by perf_event_paranoid = 4) |
 | `htop`, `wget` | monitoring, downloads |
 | `python3-numpy`, `python3-yaml` | needed by `gguf-py` to inspect model files |
 | `jq` | JSON parsing for the Claude Code status line script (not used by the fork) |
+| `gdb` (2026-10-24) | stack sampling of llama-server (perf is blocked in this container) |
 
 Repo-local git identity set with `git config user.name/user.email` (not global).
 
@@ -58,6 +59,10 @@ Helper tools in `/opt/gfx906-tools/`:
 | `mmq-bench.sh [type]` | `test-backend-ops perf` on the batch-512 matmuls (MMQ), prints `type KxN us` |
 | `sweep-mmq.sh <CFG_TYPE> <test type> NTHREADS OCC I` | edit the GCN MMQ config at J = 64 for one type, rebuild, run `mmq-bench.sh` |
 | `bw/bw.hip` | peak HBM read bandwidth test (`hipcc -O3 --offload-arch=gfx906`) |
+| `mk-ncols-ops.py <in> <out> n...` | MUL_MAT op file with n columns from the batch-1 ops (env `TYPES`, `SHAPES` filter) |
+| `mmvq-ncols-bench.sh [regex] [ns]` | matmul time per column count, e.g. `n1= n2= n3= n4=` per shape (env `TYPES`, `SHAPES`) |
+| `mtp-test.sh <label> [server args]` | llama-server t/s and draft acceptance on two greedy prompts |
+| `srvprof.py <rocpd db>` | busy / idle / gaps / kernel mix of a profiled llama-server run (raw rocpd tables) |
 
 Profiling a generation run:
 `rocprofv3 --kernel-trace -d DIR -o tg -- llama-bench -m MODEL -fa 1 -p 0 -n 64 -r 1`,
@@ -170,6 +175,42 @@ passes. Caveat: acceptance is from two greedy prompts; sampling or harder text l
 
 Plan: (1) small-batch MMVQ: more rows per workgroup / y reuse, fix n=3; (2) tiled concat for
 small token counts; (3) cheaper draft pass.
+
+### MTP progress (2026-10-24)
+
+Cause of the small-batch cost (corrected): not repeated weight decode (the compiler shares it
+across columns) but y reads. Counters (IQ3_S/IQ4_XS 5120x17408): DRAM read requests constant
+for n = 1/2/4, L2 requests 0.74M -> 1.29M -> 2.52M. Each 2-row block reads all of y.
+
+- Launch sweep of the stock kernel (nwarps 1/2/4, rows 2/4/8): 1 warp best, rows per type;
+  still ~2x n=1 at n=4. Not kept.
+- New `mul_mat_vec_q_ysh` (gfx906, 2-8 columns, no ids/fusion, K % 512 == 0): 4 waves per
+  block share each y chunk in LDS (double buffered, global loads issued before the compute and
+  stored after it); each wave owns 2 rows (4 for IQ3_S). L2 requests at n=3 back to ~n=1 level.
+  First version spilled (lambdas capturing the prefetch registers by reference): use plain code.
+- Narrow dim-0 concat kernel (one thread per element) for the ssm_conv input with 2-31 tokens:
+  ~80 us -> 13-32 us.
+
+Forward pass (ms, median of 40): 1/2/3/4/5 tokens 33.1/48.3/69.3/67.5/67.4 ->
+33.2/40.4/45.8/54.7/62.5.
+
+llama-server, greedy, 256 tokens, two prompts (t/s):
+
+| config | before | now |
+|---|---:|---:|
+| no MTP | 28 / 28 | 30 / 30 |
+| MTP draft 1 | 35 / 33 | 40 / 38 |
+| MTP draft 2 | 33 / 30 | 48 / 45 |
+| MTP draft 3 | 39 / 34 | 45 / 41 |
+| MTP draft 4 | - | 42 / 38 |
+
+Server step breakdown (draft 2, rocprofv3 kernel + memory copy trace): ~55.8 ms per step =
+verify pass (3 tokens) 46.9 + two draft passes 2 x 2.0 (output head ~1.1 each) + MTP catch-up
+pass 0.8 + host gaps ~3.3 + copies ~0.5. gdb stack sampling (perf is blocked in this
+container: perf_event_paranoid = 4, not writable) shows the server thread waiting on the GPU in
+79/80 samples. CPU sampling costs 0.33 ms per token (llama-completion perf print). HIP graphs
+off: +1 t/s at most. `--backend-sampling` falls back to CPU: ROCm has no ARGSORT for a 248K
+vocab (needed by top-p).
 
 ## Log
 
