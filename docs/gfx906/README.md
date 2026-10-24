@@ -63,6 +63,11 @@ Helper tools in `/opt/gfx906-tools/`:
 | `mmvq-ncols-bench.sh [regex] [ns]` | matmul time per column count, e.g. `n1= n2= n3= n4=` per shape (env `TYPES`, `SHAPES`) |
 | `mtp-test.sh <label> [server args]` | llama-server t/s and draft acceptance on two greedy prompts |
 | `srvprof.py <rocpd db>` | busy / idle / gaps / kernel mix of a profiled llama-server run (raw rocpd tables) |
+| `mmstats.py <rocpd db> <n tokens>` | matvec time per (type, columns, kernel variant, launch blocks) from a generation profile |
+| `hw-tune.py <label> [ENV=VAL ...]` | profiles a 32-token generation with the given env, prints matvec us/call per (type, rows) |
+| `proto/` | standalone single-column MMVQ bench (`build.sh`, `mmvq-proto <type> [filter]`, ~7 s builds), see below |
+| `proto/dump-tensors.py <gguf> <dir>` | one raw tensor per (type, shape) of the model into `proto/data/` (909 MB) for the bench |
+| `proto/pmc.sh <type> <filter>` | VALUBusy / MemUnitBusy / LDS bank conflicts / TA busy of bench variants (rocprofv3 --pmc) |
 
 Profiling a generation run:
 `rocprofv3 --kernel-trace -d DIR -o tg -- llama-bench -m MODEL -fa 1 -p 0 -n 64 -r 1`,
@@ -280,6 +285,70 @@ Remaining per delta-net layer: rms_norm 7, quantize 3.7, concat 5.6, ssm_conv 5.
 delta net (bit-exact needs the vec-path reduction order: 4 lanes per partial), ssm_conv into the
 concat kernel (needs a memory-overlap check for computing a later node early), gate/beta in one
 launch.
+
+### Weight repacking investigation and single-column MMVQ round (2026-10-24, branch gfx906-qwen38)
+
+Started as weight repacking (aligned, wider loads for IQ3_S / IQ4_XS). Result: repacking is not
+needed on gfx906; the gain came from how the compiler schedules the existing kernel's loads.
+Commit cf35d3b: tg128 32.49 -> 36.30 t/s (+11.7%), tg128 @ d8192 30.93 -> 34.25, pp unchanged,
+matvec GPU time per token 25.3 -> 22.2 ms. llama-server: no MTP 32.1 -> 35.7 / 35.6 t/s; MTP draft 2
+50.3 / 47.2 (unchanged, the 3-column verify does not use the new kernel).
+
+Prototype (`/opt/gfx906-tools/proto`): one HIP file that includes the llama.cpp headers, runs the
+stock kernel shape and variants on real model tensors, checks results against the reference.
+Per type a `load()` (raw words) / `dot()` (math) split, loop modes: plain vec_dot calls, explicit
+load phase, double buffered, half-wave rows.
+
+Findings:
+- `__launch_bounds__(n, 1)` makes the AMDGPU scheduler aim for maximum occupancy; it then issues
+  the loads of each row of a step only after the previous row's math (4-5 `s_waitcnt vmcnt(0)`
+  per loop instead of 1). `amdgpu_waves_per_eu(4, 4)` + `amdgpu_flat_work_group_size` (without
+  launch bounds, whose min-blocks argument overrides it) lets it use 64 VGPRs and keep all loads
+  in flight. Fragile: 3-4 more live VGPRs (tried: prefetching the bias / post-mul operands before
+  the loop) and it falls back to the serialized schedule (49 VGPRs, iq3_s qkv 41 -> 56 us).
+  Check: count `s_waitcnt vmcnt(0)` in the loop body (`kasm.sh` + `kloop.py`).
+- Load-only probes (same loads, no math): IQ3_S stock layout ~560-590 GB/s, repacked (per lane
+  12 B body = qs + signs, per block 14 B header = scales, qh, d; same size) ~650-680 GB/s.
+  IQ4_XS stock layout = repacked, ~750-790 GB/s. Streaming uint4 reads of 13-47 MB: 800-870 GB/s.
+- With the loads in flight the full IQ3_S kernel runs at the same speed on both layouts (VALU 66%,
+  memory unit 70% busy, rocprofv3 counters). So the limit is the decode (grid lookups in LDS, sign
+  masks), and repacking without growing the weights cannot remove it. Sign handling without
+  `v_mul_lo_u32`: ~2%. Sign-mask LDS tables (256 x uint2 / uint4): 24% fewer VALU instructions
+  but LDS bank conflicts 20% -> 35-41%, slower.
+- Half-wave rows: for K = 5120 (20 superblocks) a full wave covers 8 blocks per step, so the last
+  of 3 steps is half idle; a half wave covers 4 blocks per step and K = 20, 24, 68 divide evenly.
+  +10% on the K = 5120 shapes, neutral on K = 17408.
+- The stock vec_dot functions in the half-wave layout are within ~2% of hand-written load/dot
+  versions, so the kernel uses them for all types.
+
+Kernel `mul_mat_vec_q_hw` (mmvq.cu): gfx906, 1 column, no ids. Each half wave owns 2 rows
+(1 with a fused gate), 4 waves per block share the LDS grid. Epilogue: bias, gate + GLU,
+sigmoid / softplus*mul. Selection (measured in the model with `hw-tune.py`): IQ1/IQ2/IQ3 and Q2_K
+with >= 2048 rows; IQ4_XS and Q3_K only with a fused gate or > 5120 rows (with 5120 rows and a
+cheap decode the stock kernel's 1-wave blocks are 5-10% faster); Q4_K, Q5_K, Q6_K, IQ4_NL, Q8_0
+stay stock. Off with `GGML_CUDA_NO_MMVQ_HW=1`. Not bit-exact with stock (summation order):
+kld-check.sh 1 gives KLD 0.000384 (was 0.000341), max 0.032, same top 97.84%; ubatch 4 unchanged.
+
+Matvec ms per token (65-token profile), stock kernel -> new kernel:
+
+| type | ms | | type | ms |
+|---|---|---|---|---|
+| iq3_s | 8.16 -> 6.16 | | iq3_xxs | 2.35 -> 1.85 |
+| iq4_xs | 7.72 -> 7.25 | | iq2_s, iq2_xs, iq2_xxs, q2_K, q3_K | 3.10 -> 2.92 |
+
+Fused ffn gate+up per call: IQ3_S 179 -> 125 us, IQ4_XS 145 -> 122 us.
+
+Tried and dropped:
+- `amdgpu_waves_per_eu(4, 4)` on the stock 1-column kernel alone: IQ4_XS / Q3_K +3-6%, IQ3_S and
+  IQ2_S -4..-10%. On the ysh (2-8 column) kernel: n2 -6%, n3 -12% (it needs more than 64 VGPRs).
+- Double-buffered loads (next step's loads before this step's math): slower everywhere (VGPRs).
+- Persistent blocks (grid-stride over rows): slower. 8 rows per wave: 126 VGPRs, slower.
+- `__builtin_amdgcn_sched_group_barrier` to force the load order: no effect.
+- `test-backend-ops perf -o MUL_MAT_VEC_FUSION` with model-size cases reports ~15 us/run for a
+  47 MB matrix, unusable; fused paths were measured in the model instead.
+
+Remaining: the multi-column path used by the MTP verify (ysh kernel, 3 columns), the 5120-row
+IQ4_XS / K-quant calls (bias fused), the 48-row Q8_0 alpha / beta pair (two 9.5 us launches).
 
 ## Log
 
