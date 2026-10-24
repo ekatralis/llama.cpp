@@ -1747,6 +1747,50 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+block_q8_1 * ggml_cuda_mmvq_q8_1_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    const ggml_cgraph * cgraph = ctx.cur_cgraph;
+    if (cgraph == nullptr || ctx.curr_stream_no != 0 || !ctx.stream_context().concurrent_events.empty()) {
+        return nullptr;
+    }
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || ggml_nelements(t) % MATRIX_ROW_PADDING != 0) {
+        return nullptr;
+    }
+
+    // look a few nodes ahead for a MUL_MAT reading the same data, possibly through a view
+    const ggml_tensor * src1 = nullptr;
+    for (int j = ctx.cur_node + 1; j < cgraph->n_nodes && j <= ctx.cur_node + 16; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+        const ggml_tensor * s = node->src[1];
+        if (s->data == t->data && ggml_nbytes(s) == ggml_nbytes(t) && ggml_is_contiguous(s) &&
+                s->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_is_quantized(node->src[0]->type) &&
+                s->ne[0] % MATRIX_ROW_PADDING == 0 && s->ne[1]*s->ne[2]*s->ne[3] <= MMVQ_MAX_BATCH_SIZE) {
+            src1 = s;
+            break;
+        }
+    }
+    if (src1 == nullptr) {
+        return nullptr;
+    }
+
+    auto & cache = ctx.mmvq_q8_1_cache;
+    ctx.mmvq_q8_1_cache_release();
+    const size_t size = ggml_nelements(t)/QK8_1 * sizeof(block_q8_1);
+    size_t actual_size = 0;
+    cache.ptr    = ctx.pool().alloc(size, &actual_size);
+    cache.size   = actual_size;
+    cache.src1   = src1;
+    cache.data   = src1->data;
+    cache.device = ctx.device;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        cache.ne[i] = src1->ne[i];
+        cache.nb[i] = src1->nb[i];
+    }
+    return (block_q8_1 *) cache.ptr;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {

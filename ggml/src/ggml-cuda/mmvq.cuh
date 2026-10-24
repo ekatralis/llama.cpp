@@ -2,6 +2,10 @@
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 
+// For a node about to write t: if a following MUL_MAT will quantize t for MMVQ, return a q8_1 buffer
+// (flat layout, registered as the MMVQ src1 cache) that the producer fills in-kernel; else nullptr.
+block_q8_1 * ggml_cuda_mmvq_q8_1_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,

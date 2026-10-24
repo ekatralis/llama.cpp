@@ -4712,6 +4712,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                cuda_ctx->cur_cgraph = cgraph;
+                cuda_ctx->cur_node   = i;
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4868,6 +4871,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->mmvq_q8_1_cache_release();
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
     cuda_ctx->mmvq_q8_1_cache_release();
+    cuda_ctx->cur_cgraph = nullptr;
+    cuda_ctx->cur_node   = -1;
 
     return GGML_STATUS_SUCCESS;
 }

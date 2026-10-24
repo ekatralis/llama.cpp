@@ -1576,6 +1576,10 @@ struct ggml_backend_cuda_context {
         int                 device = -1;
     } mmvq_q8_1_cache;
 
+    // graph position while computing a graph, used to find the consumers of a node
+    const ggml_cgraph * cur_cgraph = nullptr;
+    int                 cur_node   = -1;
+
     void mmvq_q8_1_cache_release() {
         if (mmvq_q8_1_cache.ptr != nullptr) {
             pools[mmvq_q8_1_cache.device][0]->free(mmvq_q8_1_cache.ptr, mmvq_q8_1_cache.size);
