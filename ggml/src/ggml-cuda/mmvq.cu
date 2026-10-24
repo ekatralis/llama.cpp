@@ -1178,6 +1178,211 @@ static void mul_mat_vec_q_ysh_launch(
     }
 }
 
+// gfx906, one column: each half wave owns rows_per_half rows. A half wave covers 32*vdr/qi x blocks per step,
+// which divides the K of common shapes (20, 24, 68 superblocks), so no lanes idle in the last step.
+// The waves of a block share the LDS grid. The waves-per-EU bound lets the compiler keep all loads of a step
+// in flight; with launch bounds alone it minimizes VGPRs and serializes them. Keep the loop lean: a few more
+// live VGPRs (e.g. prefetched epilogue operands) push it past 64 and the loads get serialized again.
+#define MMVQ_HW_NWAVES 4
+
+// Types with an expensive decode gain on every shape. Cheap decodes only gain with more than 5120 rows or a
+// fused gate, with fewer rows the stock kernel's 1-wave blocks keep the GPU fuller.
+static bool mmvq_hw_use(ggml_type type, int nrows_x, bool gate) {
+    if (nrows_x < 2048) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+            return true;
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ4_XS:
+            return gate || nrows_x > 5120;
+        default:
+            return false;
+    }
+}
+
+static constexpr __host__ __device__ bool mmvq_hw_supported(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+#if defined(__gfx906__)
+#define MMVQ_HW_LAUNCH_BOUNDS(nthreads) __attribute__((amdgpu_flat_work_group_size(1, nthreads), amdgpu_waves_per_eu(4, 4)))
+#else
+#define MMVQ_HW_LAUNCH_BOUNDS(nthreads) __launch_bounds__(nthreads, 1)
+#endif
+
+template <ggml_type type, int nwaves, int rows_per_half, bool has_gate>
+MMVQ_HW_LAUNCH_BOUNDS(nwaves*64)
+static __global__ void mul_mat_vec_q_hw(
+        const void * __restrict__ vx, const void * __restrict__ vy, const ggml_cuda_mm_fusion_args_device fusion,
+        float * __restrict__ dst, const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 sample_ratio, const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+#if defined(__gfx906__)
+    constexpr int qk              = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi              = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr             = get_vdr_mmvq(type);
+    constexpr int lanes_per_block = qi/vdr;
+    constexpr int blocks_per_iter = 32/lanes_per_block;
+    static_assert(32 % lanes_per_block == 0, "a half wave must cover whole x blocks");
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int lane = threadIdx.x;
+    const int hl   = lane % 32;
+    const int tid  = threadIdx.y*64 + lane;
+    const int row0 = ((blockIdx.x*nwaves + threadIdx.y)*2 + lane/32)*rows_per_half;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+
+    const block_q8_1 * y = (const block_q8_1 *) vy + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
+
+    // clamp rows past the end so that reads stay in bounds, their results are not written
+    int kbx_row[rows_per_half];
+#pragma unroll
+    for (int i = 0; i < rows_per_half; ++i) {
+        const uint32_t row = min(uint32_t(row0 + i), nrows_x - 1);
+        kbx_row[i] = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
+    }
+
+    constexpr int  grid_size = mmvq_lds_grid_size(type);
+    constexpr bool lds_grid  = grid_size > 0;
+    constexpr vec_dot_q_grid_cuda_t vec_dot_q_grid_cuda = get_vec_dot_q_grid_cuda(type);
+    __shared__ __align__(16) uint32_t grid_lds[lds_grid ? grid_size : 1];
+    if constexpr (lds_grid) {
+        const uint32_t * grid = get_iq_grid(type);
+        for (int i = tid; i < grid_size; i += nwaves*64) {
+            grid_lds[i] = grid[i];
+        }
+        __syncthreads();
+    }
+
+    [[maybe_unused]] const void * vgate = fusion.gate;
+
+    float tmp[rows_per_half]      = {0.0f};
+    float tmp_gate[rows_per_half] = {0.0f};
+
+    const int blocks_per_row_x = ncols_x/qk;
+    const int kqs = vdr*(hl % lanes_per_block);
+    for (int kbx = hl/lanes_per_block; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const block_q8_1 * yb = y + kbx*(qk/QK8_1);
+#pragma unroll
+        for (int i = 0; i < rows_per_half; ++i) {
+            if constexpr (lds_grid) {
+                tmp[i] += vec_dot_q_grid_cuda(vx, yb, kbx_row[i] + kbx, kqs, grid_lds);
+                if constexpr (has_gate) {
+                    tmp_gate[i] += vec_dot_q_grid_cuda(vgate, yb, kbx_row[i] + kbx, kqs, grid_lds);
+                }
+            } else {
+                tmp[i] += vec_dot_q_cuda(vx, yb, kbx_row[i] + kbx, kqs);
+                if constexpr (has_gate) {
+                    tmp_gate[i] += vec_dot_q_cuda(vgate, yb, kbx_row[i] + kbx, kqs);
+                }
+            }
+        }
+    }
+
+    const uint32_t dst_off = sample_dst*stride_sample_dst + channel_dst*stride_channel_dst;
+#pragma unroll
+    for (int i = 0; i < rows_per_half; ++i) {
+        float result = warp_reduce_sum<32>(tmp[i]);
+        [[maybe_unused]] float gate_value = 0.0f;
+        if constexpr (has_gate) {
+            gate_value = warp_reduce_sum<32>(tmp_gate[i]);
+        }
+        const uint32_t row = row0 + i;
+        if (hl != i || row >= nrows_x) {
+            continue;
+        }
+        if (fusion.x_bias != nullptr) {
+            result += ((const float *) fusion.x_bias)[dst_off + row];
+        }
+        if constexpr (has_gate) {
+            if (fusion.gate_bias != nullptr) {
+                gate_value += ((const float *) fusion.gate_bias)[dst_off + row];
+            }
+            switch (fusion.glu_op) {
+                case GGML_GLU_OP_SWIGLU:
+                    result *= ggml_cuda_op_silu_single(gate_value);
+                    break;
+                case GGML_GLU_OP_GEGLU:
+                    result *= ggml_cuda_op_gelu_single(gate_value);
+                    break;
+                case GGML_GLU_OP_SWIGLU_OAI:
+                    result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                    break;
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, fusion.glu_limit);
+                    break;
+                default:
+                    result = result * gate_value;
+                    break;
+            }
+        } else if (fusion.post_op == GGML_CUDA_MM_POST_SIGMOID) {
+            result = 1.0f / (1.0f + expf(-result));
+        } else if (fusion.post_op == GGML_CUDA_MM_POST_SOFTPLUS_MUL) {
+            result = ((result > 20.0f) ? result : logf(1.0f + expf(result))) * fusion.post_mul[dst_off + row];
+        }
+        dst[dst_off + row] = result;
+    }
+#else
+    GGML_UNUSED_VARS(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, channel_ratio, stride_channel_x,
+        stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    NO_DEVICE_CODE;
+#endif // defined(__gfx906__)
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_hw_launch(
+        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x,
+        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
+    constexpr int nwaves = MMVQ_HW_NWAVES;
+    const dim3 block_dims(64, nwaves, 1);
+    // a fused gate doubles the loads per row, so it gets half the rows
+    if (fusion.gate != nullptr) {
+        constexpr int rph = 1;
+        const dim3 block_nums((nrows_x + nwaves*2*rph - 1)/(nwaves*2*rph), nchannels_dst, nsamples_dst);
+        mul_mat_vec_q_hw<type, nwaves, rph, true><<<block_nums, block_dims, 0, stream>>>(
+            vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, channel_ratio, stride_channel_x, stride_channel_y,
+            stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    } else {
+        constexpr int rph = 2;
+        const dim3 block_nums((nrows_x + nwaves*2*rph - 1)/(nwaves*2*rph), nchannels_dst, nsamples_dst);
+        mul_mat_vec_q_hw<type, nwaves, rph, false><<<block_nums, block_dims, 0, stream>>>(
+            vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, channel_ratio, stride_channel_x, stride_channel_y,
+            stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    }
+}
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
@@ -1515,6 +1720,21 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 ncols_x % 512 == 0) {
             mul_mat_vec_q_ysh_launch<type>(
                 vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                nchannels_dst, nsamples_dst, stream);
+            return;
+        }
+    }
+
+    if constexpr (mmvq_hw_supported(type)) {
+        static const bool hw_disabled = getenv("GGML_CUDA_NO_MMVQ_HW") != nullptr;
+        const bool hw_fusion_ok = fusion.shared_up == nullptr && fusion.x_scale == nullptr && fusion.gate_scale == nullptr &&
+                                  (fusion.gate == nullptr || fusion.post_op == GGML_CUDA_MM_POST_NONE);
+        if (!hw_disabled && table_id == MMVQ_PARAMETERS_VEGA20 && ncols_dst == 1 && !has_ids && hw_fusion_ok &&
+                mmvq_hw_use(type, nrows_x, fusion.gate != nullptr)) {
+            mul_mat_vec_q_hw_launch<type>(
+                vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x,
                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                 nchannels_dst, nsamples_dst, stream);
