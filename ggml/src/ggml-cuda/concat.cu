@@ -1,5 +1,7 @@
 #include "concat.cuh"
 
+#define GGML_CUDA_CONV_STATE_MAX 16
+
 #include <stdint.h>
 
 // contiguous kernels
@@ -320,4 +322,50 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 GGML_ABORT("Unsupported type size: %zu", ggml_type_size(src0->type));
         }
     }
+}
+
+static __global__ void concat_conv_state_f32(
+        const float * state, const int32_t * state_idx, const int64_t state_row_stride,
+        const float * x, const int64_t sx0, const int64_t sx1,
+        float * out, float * state_dst, const int dc, const int n, const int nch) {
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nch) {
+        return;
+    }
+    const float * s = state + (state_idx != nullptr ? state_idx[0]*state_row_stride : 0) + (int64_t) c*dc;
+
+    // all reads before the writes: state and state_dst may be the same cache row
+    float v[GGML_CUDA_CONV_STATE_MAX];
+    for (int j = 0; j < dc; ++j) {
+        v[j] = s[j];
+    }
+    for (int t = 0; t < n; ++t) {
+        v[dc + t] = x[t*sx0 + c*sx1];
+    }
+    float * o = out + (int64_t) c*(dc + n);
+    for (int j = 0; j < dc + n; ++j) {
+        o[j] = v[j];
+    }
+    float * sd = state_dst + (int64_t) c*dc;
+    for (int j = 0; j < dc; ++j) {
+        sd[j] = v[n + j];
+    }
+}
+
+void ggml_cuda_op_concat_conv_state(ggml_backend_cuda_context & ctx, ggml_tensor * concat, ggml_tensor * cpy,
+                                    const float * state_src, const int32_t * state_idx) {
+    const ggml_tensor * src0 = concat->src[0];
+    const ggml_tensor * src1 = concat->src[1];
+    const int dc  = src0->ne[0];
+    const int n   = src1->ne[0];
+    const int nch = src0->ne[1];
+    GGML_ASSERT(dc + n <= GGML_CUDA_CONV_STATE_MAX);
+
+    const float * state = state_idx != nullptr ? state_src : (const float *) src0->data;
+    const int64_t state_row_stride = state_idx != nullptr ? (int64_t) dc*nch : 0;
+
+    const int block = 256;
+    concat_conv_state_f32<<<(nch + block - 1)/block, block, 0, ctx.stream()>>>(
+        state, state_idx, state_row_stride, (const float *) src1->data, src1->nb[0]/sizeof(float), src1->nb[1]/sizeof(float),
+        (float *) concat->data, (float *) cpy->src[1]->data, dc, n, nch);
 }

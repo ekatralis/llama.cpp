@@ -2711,6 +2711,42 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+// conv state shift: CONCAT(dim 0) of [dc state columns, n new columns] -> conv_input, then VIEW of its last dc
+// columns, VIEW of the cache row and CPY into it (delta net / mamba conv states)
+static bool ggml_cuda_match_conv_state_concat(const ggml_cgraph * cgraph, int i) {
+    if (i + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * concat = cgraph->nodes[i];
+    const ggml_tensor * last   = cgraph->nodes[i + 1];
+    const ggml_tensor * dstv   = cgraph->nodes[i + 2];
+    const ggml_tensor * cpy    = cgraph->nodes[i + 3];
+    if (concat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(concat, 0) != 0 || last->op != GGML_OP_VIEW ||
+            dstv->op != GGML_OP_VIEW || cpy->op != GGML_OP_CPY) {
+        return false;
+    }
+    const ggml_tensor * src0 = concat->src[0];
+    const ggml_tensor * src1 = concat->src[1];
+    const int64_t dc  = src0->ne[0];
+    const int64_t n   = src1->ne[0];
+    const int64_t nch = src0->ne[1];
+    if (concat->type != GGML_TYPE_F32 || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(src0) || !ggml_is_contiguous(concat) || src1->ne[1] != nch || concat->ne[0] != dc + n ||
+            concat->ne[2] != 1 || concat->ne[3] != 1 || dc + n > 16) {
+        return false;
+    }
+    if (last->view_src != concat || last->ne[0] != dc || last->ne[1] != nch || last->ne[2] != 1 || last->ne[3] != 1 ||
+            last->view_offs != (size_t) n*sizeof(float) || last->nb[1] != concat->nb[1] ||
+            (last->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i + 1) != 1) {
+        return false;
+    }
+    if (cpy->src[0] != last || cpy->src[1] != dstv || dstv->type != GGML_TYPE_F32 || !ggml_is_contiguous(dstv) ||
+            ggml_nelements(dstv) != dc*nch) {
+        return false;
+    }
+    return true;
+}
+
 // Recurrent state gather (GET_ROWS of one cache row) whose only real consumer is the state input of a
 // gated delta net with few tokens: skip it, the delta net reads the cache row through the index.
 static bool ggml_cuda_try_defer_state_rows(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i) {
@@ -2754,6 +2790,10 @@ static bool ggml_cuda_try_defer_state_rows(ggml_backend_cuda_context * ctx, cons
                     continue;
                 }
                 if (u->op == GGML_OP_GATED_DELTA_NET && k == 5 && u->src[2]->ne[2] <= 8 && u->src[2]->ne[3] == 1) {
+                    found_gdn = true;
+                    continue;
+                }
+                if (u->op == GGML_OP_CONCAT && k == 0 && ggml_cuda_match_conv_state_concat(cgraph, j)) {
                     found_gdn = true;
                     continue;
                 }
@@ -3887,6 +3927,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 return match.node_count - 1;
             }
         }
+    }
+
+    // conv state shift: concat + copy of the new state in one kernel, reading a deferred state gather directly
+    if (node->op == GGML_OP_CONCAT && ggml_cuda_match_conv_state_concat(cgraph, i)) {
+        const ggml_tensor * s = node->src[0];
+        while (s->view_src != nullptr && s->op != GGML_OP_GET_ROWS) {
+            s = s->view_src;
+        }
+        const float   * state_src = nullptr;
+        const int32_t * state_idx = nullptr;
+        for (ggml_tensor * t : cuda_ctx->deferred_state_rows) {
+            if (t == s) {
+                state_src = (const float *) t->src[0]->data;
+                state_idx = (const int32_t *) t->src[1]->data;
+            }
+        }
+        ggml_cuda_op_concat_conv_state(*cuda_ctx, node, cgraph->nodes[i + 3], state_src, state_idx);
+        return 3;
     }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
