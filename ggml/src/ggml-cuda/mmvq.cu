@@ -941,6 +941,219 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+// gfx906, 2-8 columns: y is the bottleneck when every 2-row block reads all of it through L2.
+// Here the waves of a block share each y chunk via LDS and each wave owns rows_per_wave rows.
+#define MMVQ_YSH_NWAVES 4
+
+static constexpr __host__ __device__ bool mmvq_ysh_supported(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static constexpr __host__ __device__ int mmvq_ysh_rows_per_wave(ggml_type type) {
+    return type == GGML_TYPE_IQ3_S ? 4 : 2;
+}
+
+template <ggml_type type, int ncols_dst, int nwaves, int rows_per_wave>
+__launch_bounds__(nwaves*64, 1)
+static __global__ void mul_mat_vec_q_ysh(
+        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+#if defined(__gfx906__)
+    constexpr int qk              = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi              = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr             = get_vdr_mmvq(type);
+    constexpr int warp_size       = 64;
+    constexpr int nthreads        = nwaves*warp_size;
+    constexpr int blocks_per_iter = vdr*warp_size/qi;                         // x blocks per k step
+    constexpr int ybl_per_iter    = blocks_per_iter*(qk/QK8_1);               // y blocks per column per k step
+    constexpr int chunk_i4        = ybl_per_iter*int(sizeof(block_q8_1))/16;  // int4 per column per k step
+    constexpr int nload           = (ncols_dst*chunk_i4 + nthreads - 1)/nthreads;
+    static_assert(ybl_per_iter*sizeof(block_q8_1) % 16 == 0, "y chunk must be a multiple of 16 bytes");
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int lane = threadIdx.x;
+    const int tid  = threadIdx.y*warp_size + lane;
+    const int row0 = (blockIdx.x*nwaves + threadIdx.y)*rows_per_wave;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+
+    const block_q8_1 * y = (const block_q8_1 *) vy + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
+
+    // clamp rows past the end so that reads stay in bounds, their results are not written
+    int kbx_row[rows_per_wave];
+#pragma unroll
+    for (int i = 0; i < rows_per_wave; ++i) {
+        const uint32_t row = min(uint32_t(row0 + i), nrows_x - 1);
+        kbx_row[i] = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
+    }
+
+    constexpr int  grid_size = mmvq_lds_grid_size(type);
+    constexpr bool lds_grid  = grid_size > 0;
+    constexpr vec_dot_q_grid_cuda_t vec_dot_q_grid_cuda = get_vec_dot_q_grid_cuda(type);
+    __shared__ __align__(16) uint32_t grid_lds[lds_grid ? grid_size : 1];
+    if constexpr (lds_grid) {
+        const uint32_t * grid = get_iq_grid(type);
+        for (int i = tid; i < grid_size; i += nthreads) {
+            grid_lds[i] = grid[i];
+        }
+    }
+
+    __shared__ int4 y_lds[2][ncols_dst][chunk_i4];
+
+    const int blocks_per_row_x = ncols_x/qk;
+    const int ybl_total        = blocks_per_row_x*(qk/QK8_1);
+
+    // this thread's share of a y chunk: column j_l[l], int4 k_l[l] (j_l >= ncols_dst: none)
+    int j_l[nload];
+    int k_l[nload];
+#pragma unroll
+    for (int l = 0; l < nload; ++l) {
+        const int idx = l*nthreads + tid;
+        j_l[l] = idx/chunk_i4;
+        k_l[l] = idx - j_l[l]*chunk_i4;
+    }
+
+    int4 y_pre[nload];
+#define YSH_LOAD(kb0_next)                                                                     \
+    {                                                                                          \
+        const int ybl0 = (kb0_next)*(qk/QK8_1);                                                \
+        const int n_i4 = min(chunk_i4, (ybl_total - ybl0)*int(sizeof(block_q8_1))/16);        \
+        _Pragma("unroll")                                                                      \
+        for (int l = 0; l < nload; ++l) {                                                      \
+            y_pre[l] = make_int4(0, 0, 0, 0);                                                  \
+            if (j_l[l] < ncols_dst && k_l[l] < n_i4) {                                         \
+                y_pre[l] = ((const int4 *) (y + j_l[l]*stride_col_y + ybl0))[k_l[l]];          \
+            }                                                                                  \
+        }                                                                                      \
+    }
+#define YSH_STORE(b)                                                                           \
+    {                                                                                          \
+        _Pragma("unroll")                                                                      \
+        for (int l = 0; l < nload; ++l) {                                                      \
+            if (j_l[l] < ncols_dst) {                                                          \
+                y_lds[(b)][j_l[l]][k_l[l]] = y_pre[l];                                         \
+            }                                                                                  \
+        }                                                                                      \
+    }
+
+    float tmp[ncols_dst][rows_per_wave] = {{0.0f}};
+
+    YSH_LOAD(0);
+    YSH_STORE(0);
+
+    int buf = 0;
+    for (int kb0 = 0; kb0 < blocks_per_row_x; kb0 += blocks_per_iter) {
+        __syncthreads();
+
+        const bool more = kb0 + blocks_per_iter < blocks_per_row_x;
+        if (more) {
+            YSH_LOAD(kb0 + blocks_per_iter);
+        }
+
+        const int kbx = kb0 + lane/(qi/vdr);
+        if (kbx < blocks_per_row_x) {
+            const int kqs = vdr*(lane % (qi/vdr));
+            const int kby = (kbx - kb0)*(qk/QK8_1);
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const block_q8_1 * yj = (const block_q8_1 *) y_lds[buf][j] + kby;
+#pragma unroll
+                for (int i = 0; i < rows_per_wave; ++i) {
+                    if constexpr (lds_grid) {
+                        tmp[j][i] += vec_dot_q_grid_cuda(vx, yj, kbx_row[i] + kbx, kqs, grid_lds);
+                    } else {
+                        tmp[j][i] += vec_dot_q_cuda(vx, yj, kbx_row[i] + kbx, kqs);
+                    }
+                }
+            }
+        }
+
+        if (more) {
+            YSH_STORE(buf ^ 1);
+        }
+        buf ^= 1;
+    }
+#undef YSH_LOAD
+#undef YSH_STORE
+
+    dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_wave; ++i) {
+            const float sum = warp_reduce_sum<warp_size>(tmp[j][i]);
+            if (lane == 0 && uint32_t(row0 + i) < nrows_x) {
+                dst[j*stride_col_dst + i] = sum;
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio,
+        stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y,
+        stride_sample_dst);
+    NO_DEVICE_CODE;
+#endif // defined(__gfx906__)
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_ysh_launch(
+        const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
+    constexpr int nwaves = MMVQ_YSH_NWAVES;
+    constexpr int rpw    = mmvq_ysh_rows_per_wave(type);
+    const dim3 block_nums((nrows_x + nwaves*rpw - 1)/(nwaves*rpw), nchannels_dst, nsamples_dst);
+    const dim3 block_dims(64, nwaves, 1);
+
+    const auto launch = [&](auto ncols_tag) {
+        constexpr int c_ncols_dst = decltype(ncols_tag)::value;
+        mul_mat_vec_q_ysh<type, c_ncols_dst, nwaves, rpw><<<block_nums, block_dims, 0, stream>>>(
+            vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio,
+            stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y,
+            stride_sample_dst);
+    };
+    switch (ncols_dst) {
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        case 7: launch(std::integral_constant<int, 7>{}); break;
+        case 8: launch(std::integral_constant<int, 8>{}); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
@@ -1265,6 +1478,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
         return idle * 8 <= iters_wide * 2;
     };
+
+    if constexpr (mmvq_ysh_supported(type)) {
+        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr;
+        if (table_id == MMVQ_PARAMETERS_VEGA20 && !has_ids && !has_fusion && ncols_dst >= 2 && ncols_dst <= 8 &&
+                ncols_x % 512 == 0) {
+            mul_mat_vec_q_ysh_launch<type>(
+                vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                nchannels_dst, nsamples_dst, stream);
+            return;
+        }
+    }
 
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
