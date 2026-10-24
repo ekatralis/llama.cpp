@@ -970,8 +970,8 @@ static constexpr __host__ __device__ bool mmvq_ysh_supported(ggml_type type) {
     }
 }
 
-static constexpr __host__ __device__ int mmvq_ysh_rows_per_wave(ggml_type type) {
-    return type == GGML_TYPE_IQ3_S ? 4 : 2;
+static constexpr __host__ __device__ int mmvq_ysh_rows_per_wave(ggml_type type, int ncols_dst) {
+    return type == GGML_TYPE_IQ3_S && ncols_dst >= 4 ? 4 : 2;
 }
 
 template <ggml_type type, int ncols_dst, int nwaves, int rows_per_wave>
@@ -1131,12 +1131,12 @@ static void mul_mat_vec_q_ysh_launch(
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
     constexpr int nwaves = MMVQ_YSH_NWAVES;
-    constexpr int rpw    = mmvq_ysh_rows_per_wave(type);
-    const dim3 block_nums((nrows_x + nwaves*rpw - 1)/(nwaves*rpw), nchannels_dst, nsamples_dst);
     const dim3 block_dims(64, nwaves, 1);
 
     const auto launch = [&](auto ncols_tag) {
         constexpr int c_ncols_dst = decltype(ncols_tag)::value;
+        constexpr int rpw         = mmvq_ysh_rows_per_wave(type, c_ncols_dst);
+        const dim3 block_nums((nrows_x + nwaves*rpw - 1)/(nwaves*rpw), nchannels_dst, nsamples_dst);
         mul_mat_vec_q_ysh<type, c_ncols_dst, nwaves, rpw><<<block_nums, block_dims, 0, stream>>>(
             vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio,
             stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y,
