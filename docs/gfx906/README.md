@@ -212,6 +212,32 @@ container: perf_event_paranoid = 4, not writable) shows the server thread waitin
 off: +1 t/s at most. `--backend-sampling` falls back to CPU: ROCm has no ARGSORT for a 248K
 vocab (needed by top-p).
 
+### MTP / generation round 3 (2026-10-24)
+
+- ysh kernel: IQ3_S uses 2 rows per wave below 4 columns (n = 3: 3-7% faster).
+  `amdgpu_waves_per_eu` hints (2/3/4) change nothing. More waves per block or rows per wave:
+  see sweep in the commit history; 4 waves x 2 rows is best for the other types.
+- n = 3 vs n = 1 pass (llama-bench -p N, 30 reps): matmuls +10.6 ms of +11.9 ms. K-quants scale
+  worst (Q4_K 1.8x, Q5_K 1.67x): half of the Q4_K dp4a compute per-thread sums of y (the
+  m term); the fp16 block sum (ds.y) would avoid them but changes numerics, not done.
+- `llama-bench -p N` starts from an empty sequence each repetition, so it zeroes every recurrent
+  state each pass (scale_f32 over 786432 floats, ~0.8 ms/pass). Normal decoding does not.
+- The recurrent state gather (`k_get_rows_float_vec`, 48 x 12-20 us per pass) is an identity
+  copy in the single sequence case. Skipping it needs a non-mutating s_copy, a graph reuse key
+  and a fallback after rejected drafts (rollback snapshots); not done.
+- MMVQ q8_1 reuse (`d402b46`): matmuls on the same src1 reuse the last quantized copy within a
+  graph (176 of 461 quantize launches per token). tg128 30.43 -> 30.94; MTP draft 2: 49 / 46 t/s.
+- ROCm env knobs on tg128 (HIP_FORCE_DEV_KERNARG, DEBUG_CLR_GRAPH_PACKET_CAPTURE 0/1,
+  GPU_MAX_HW_QUEUES=1, HSA_ENABLE_SDMA=0): no change.
+- Full `test-backend-ops`: only TOPK_MOE cases fail, same as stock (which cases fail varies
+  per run).
+
+Generation now (31.9 ms GPU per token, 1675 kernels): matmuls 25.1 ms; ~1210 small kernels take
+~6.8 ms, nearly all 3.7-5 us each regardless of size (dispatch bound). A delta-net layer has ~20
+small kernels (~100 us). Fusion candidates per token: rms_norm + quantize ~0.45 ms, swiglu +
+quantize ~0.25 ms, gated norm + silu + quantize ~0.35 ms, l2 norms into the GDN kernel ~0.35 ms,
+beta/alpha path (2 tiny matmuls + add + softplus*a + sigmoid) ~0.7 ms.
+
 ## Log
 
 ### 2026-10-23
