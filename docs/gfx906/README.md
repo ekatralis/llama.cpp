@@ -350,6 +350,29 @@ Tried and dropped:
 Remaining: the multi-column path used by the MTP verify (ysh kernel, 3 columns), the 5120-row
 IQ4_XS / K-quant calls (bias fused), the 48-row Q8_0 alpha / beta pair (two 9.5 us launches).
 
+### Half-wave MMVQ for 2-4 columns (2026-10-24, e64e5f4)
+
+For the MTP verify (3 columns with draft 2). Proof of concept in `proto/` first (`NC=3 mmvq-proto <type>`),
+then in mmvq.cu: `mul_mat_vec_q_hw` takes 1-4 columns.
+
+- With the stock vec_dot calls per (column, row) the compiler shares the x loads between columns
+  (same addresses), but it interleaves the rows' loads with the math again (6-14 `vmcnt(0)` waits
+  per loop for IQ3_S / IQ4_XS / IQ2). `mmvq_hw_split<type>`: load all raw x words of the step's
+  rows and the y blocks, an empty asm memory barrier, then the math per row for all columns
+  (same integer math as vec_dot). Done for IQ3_S, IQ3_XXS, IQ4_XS; other types stay on ysh.
+- Launch shape per column count (proto sweep, then model): 2 columns 4 waves x 3 rows per half
+  wave at 3 waves/EU; 3 columns the same for the grid types, 2 x 4 at 2 waves/EU for IQ4_XS;
+  4 columns 2 x 4 at 2 waves/EU (IQ4_XS 2 x 3, 2 x 4 spills at 128 VGPRs).
+- test-backend-ops perf, 2 / 3 / 4 columns, sum over the 18 IQ3_S / IQ3_XXS / IQ4_XS shapes:
+  +18 / +21 / +24% (up to +45%; IQ4_XS 17408x5120 at 2 columns -8%, a few 5120-row shapes flat).
+- Forward pass of 2 / 3 / 4 tokens (llama-bench -p N): 39.3 / 43.9 / 53.4 -> 35.6 / 39.3 / 45.6 ms.
+- llama-server MTP draft 2: 50.3 / 47.2 -> 54.2 / 51.2 t/s; draft 3: 47.0 / 42.5 -> 52.3 / 47.1;
+  no MTP unchanged (35.5 / 35.4). tg128 36.1, pp512 386 (unchanged).
+
+3-token pass after this (31.0 ms matvec): still on ysh IQ2_S ~2.0 ms, Q4_K ~1.5, Q3_K ~1.3,
+Q8_0 48 rows (alpha / beta, 96 x 12 us) ~1.2, Q5_K ~0.7, IQ2_XS / IQ2_XXS / Q2_K ~1.1.
+Split paths for IQ2_S and the K-quants might save ~1.5 ms per pass.
+
 ### Output reference points (vs stock upstream f5027fb)
 
 Measured with `kld-check.sh` (KL divergence of the logits vs stock; ubatch 512 = prompt kernels,
@@ -360,6 +383,7 @@ Measured with `kld-check.sh` (KL divergence of the logits vs stock; ubatch 512 =
 | f5027fb (upstream base) | identical | identical |
 | a25d385 .. 642a6b6 | same as stock (KLD 0, max = stock run-to-run noise) | differs: KLD 0.000341, same top 97.6% |
 | cf35d3b .. | same as stock (rechecked at 97d07dd) | differs: KLD 0.000384, same top 97.8% |
+| e64e5f4 .. | same as stock | ubatch 1 as cf35d3b; ubatch 3 / 4: KLD 0.000348 / 0.000328 |
 
 - Generation output has not been bit-identical to stock since the first fork commit a25d385
   (batch-1 MMVQ launch shape 2 -> 1 warps changes the float summation order). The size is the same
@@ -368,6 +392,8 @@ Measured with `kld-check.sh` (KL divergence of the logits vs stock; ubatch 512 =
   identical to the previous fork build (same kld-check numbers, identical MTP outputs).
 - cf35d3b (half-wave single-column MMVQ) changes the generation results again (summation order).
   `GGML_CUDA_NO_MMVQ_HW=1` restores the 642a6b6 results. ubatch 4 results did not change.
+- e64e5f4 (half-wave MMVQ for 2-4 columns) changes the multi-token results (ubatch 2-4, MTP
+  verify); ubatch 4 KLD vs stock 0.000323 -> 0.000328. Also off with `GGML_CUDA_NO_MMVQ_HW=1`.
 
 ## Log
 
