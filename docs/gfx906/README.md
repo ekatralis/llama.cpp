@@ -238,6 +238,49 @@ small kernels (~100 us). Fusion candidates per token: rms_norm + quantize ~0.45 
 quantize ~0.25 ms, gated norm + silu + quantize ~0.35 ms, l2 norms into the GDN kernel ~0.35 ms,
 beta/alpha path (2 tiny matmuls + add + softplus*a + sigmoid) ~0.7 ms.
 
+### Small-kernel fusion round (2026-10-24, branch gfx906-qwen38)
+
+Generation was ~79% matmul; the rest was ~1210 small kernels per token at 3.7-5 us each
+(dispatch bound). All changes below keep the logits bit-identical (kld-check.sh 1 and 4 give the
+same numbers as before; MTP server outputs compared with an env switch / previous build).
+
+| commit | change | tg128 t/s |
+|---|---|---:|
+| (before) | | 30.43 |
+| d402b46 | reuse the MMVQ q8_1 copy of src1 across matmuls in a graph | 30.94 |
+| 6cdfbae | SWIGLU / silu*mul kernels write the q8_1 copy (in-kernel quantize) | 31.15 |
+| 18c3d74 | ssm_alpha/ssm_beta: MMVQ epilogue does +bias, softplus*a / sigmoid | 31.39 |
+| cfc6d64 | delta net reads the recurrent state cache row via the gather index (GET_ROWS skipped) | 32.06 |
+| 052ca53 | conv state shift: concat + state copy-back in one kernel, reading the cache row | 32.54 |
+
+Kernels per token 1675 -> 1295, GPU time per token 31.9 -> 30.2 ms.
+After the round: tg128 32.54, tg128 @ d8192 30.81 (was 29.09), pp512 385 (unchanged).
+llama-server (two greedy prompts, 256 tokens): no MTP 32.1 / 32.1 t/s; MTP draft 2 50.1 / 46.9;
+draft 3 47.0 / 42.6. Full test-backend-ops: only TOPK_MOE (flaky, as stock); model ops 154/161
+(same 7 as stock).
+
+Details and negatives:
+- In-kernel quantize uses the same butterfly order as quantize_q8_1 (`quantize-lane.cuh`), so the
+  q8_1 data is identical. Producers find their consumer by looking ahead 16 graph nodes for a
+  MUL_MAT on the same data (possibly a view) and register the buffer in the MMVQ src1 cache.
+- rms_norm + quantize was not faster: one 1024-thread block per row, the extra shuffle chain is
+  serial (+3.4 us vs a 3.8 us quantize launch). Without the division: 9.4 us, still no win.
+  Other rms_norm launch shapes for 5120 columns (256x5, 512x3, 128x16): all slower than 1024x4.
+- The gate fusion variant of MMVQ (has_fusion) was 40% slower for the 48-row Q8_0 matmuls (gate
+  machinery in the k loop, 954 vs 216 instructions); the post op now runs in the plain variant.
+- Deferred GET_ROWS: only for one cache row (one sequence), consumers checked with the graph use
+  counts through views; delta net with <= 8 tokens (AR kernel; the MMA path is skipped), or a
+  matching conv-state concat. Off with `GGML_CUDA_NO_DEFER_STATE_ROWS=1`. In place is safe:
+  each thread loads its state elements before writing them.
+- ROCm env knobs, more waves per EU, rope (latency of powf/sinf, 9.9 us for 4 or 24 heads):
+  no change / not done.
+
+Remaining per delta-net layer: rms_norm 7, quantize 3.7, concat 5.6, ssm_conv 5.0,
+2 x l2 norm 7.7, delta net 13.4, gated norm 4.5 us, plus the matmuls. Not done: l2 norms into the
+delta net (bit-exact needs the vec-path reduction order: 4 lanes per partial), ssm_conv into the
+concat kernel (needs a memory-overlap check for computing a later node early), gate/beta in one
+launch.
+
 ## Log
 
 ### 2026-10-23
