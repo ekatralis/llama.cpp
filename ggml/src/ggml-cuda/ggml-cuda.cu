@@ -4451,6 +4451,63 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // mul_mat [+ reshape] + add + softplus + mul, mul_mat [+ reshape] + sigmoid (gated delta net gate and beta):
+    // done in the MMVQ epilogue
+    if (node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
+        for (const bool with_reshape : { true, false }) {
+            const int r = with_reshape ? 1 : 0;
+            const ggml_tensor * mm_out = with_reshape ? cgraph->nodes[std::min(i + 1, cgraph->n_nodes - 1)] : node;
+            if (with_reshape && (mm_out->op != GGML_OP_RESHAPE || mm_out->src[0] != node)) {
+                continue;
+            }
+
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            int n_fused = 0;
+
+            const ggml_op ops_sig[]  = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY };
+            const ggml_op ops_sp[]   = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+            const ggml_op ops_sig0[] = { GGML_OP_MUL_MAT, GGML_OP_UNARY };
+            const ggml_op ops_sp0[]  = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+
+            const int n_sig = 2 + r;
+            const int n_sp  = 4 + r;
+            const int out_sig[] = { i + n_sig - 1 };
+            const int out_sp[]  = { i + n_sp - 1 };
+
+            if (ggml_can_fuse_subgraph(cgraph, i, n_sig, with_reshape ? ops_sig : ops_sig0, out_sig, 1) &&
+                    ggml_get_unary_op(cgraph->nodes[i + n_sig - 1]) == GGML_UNARY_OP_SIGMOID &&
+                    cgraph->nodes[i + n_sig - 1]->src[0] == mm_out &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_sig, out_sig, 1)) {
+                fusion_data.post_op = GGML_CUDA_MM_POST_SIGMOID;
+                n_fused = n_sig;
+            } else if (ggml_can_fuse_subgraph(cgraph, i, n_sp, with_reshape ? ops_sp : ops_sp0, out_sp, 1) &&
+                    ggml_get_unary_op(cgraph->nodes[i + r + 2]) == GGML_UNARY_OP_SOFTPLUS &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_sp, out_sp, 1)) {
+                const ggml_tensor * add = cgraph->nodes[i + r + 1];
+                const ggml_tensor * sp  = cgraph->nodes[i + r + 2];
+                const ggml_tensor * mul = cgraph->nodes[i + r + 3];
+                const ggml_tensor * bias = add->src[0] == mm_out ? add->src[1] : add->src[1] == mm_out ? add->src[0] : nullptr;
+                const ggml_tensor * vec  = mul->src[0] == sp ? mul->src[1] : mul->src[1] == sp ? mul->src[0] : nullptr;
+                if (bias && vec && sp->src[0] == add &&
+                        ggml_are_same_shape(add->src[0], add->src[1]) && ggml_are_same_shape(mul->src[0], mul->src[1]) &&
+                        bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) && ggml_is_contiguous(vec)) {
+                    fusion_data.x_bias   = bias;
+                    fusion_data.post_op  = GGML_CUDA_MM_POST_SOFTPLUS_MUL;
+                    fusion_data.post_mul = vec;
+                    n_fused = n_sp;
+                }
+            }
+
+            if (n_fused > 0) {
+                // write the final node's data with the matmul's shape
+                ggml_tensor out = *node;
+                out.data = cgraph->nodes[i + n_fused - 1]->data;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, &out, &fusion_data);
+                return n_fused - 1;
+            }
+        }
+    }
+
     // mul_mat + add
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;

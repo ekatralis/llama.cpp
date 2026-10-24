@@ -779,6 +779,21 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
+    // bias + elementwise post op without the gate machinery (plain variant, see mul_mat_vec_q_switch_fusion)
+    [[maybe_unused]] float post_bias = 0.0f;
+    [[maybe_unused]] float post_mul  = 1.0f;
+    if constexpr (!has_fusion && ncols_dst == 1) {
+        if (fusion.post_op != GGML_CUDA_MM_POST_NONE && threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+                (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+            if (fusion.x_bias != nullptr) {
+                post_bias = ((const float *) fusion.x_bias)[row0 + threadIdx.x];
+            }
+            if (fusion.post_op == GGML_CUDA_MM_POST_SOFTPLUS_MUL) {
+                post_mul = fusion.post_mul[row0 + threadIdx.x];
+            }
+        }
+    }
+
     // partial sum for each thread
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
@@ -925,6 +940,15 @@ static __global__ void mul_mat_vec_q(
                             default:
                                 result = result * gate_value;
                                 break;
+                        }
+                    }
+                } else if constexpr (ncols_dst == 1) {
+                    if (fusion.post_op != GGML_CUDA_MM_POST_NONE) {
+                        result += post_bias;
+                        if (fusion.post_op == GGML_CUDA_MM_POST_SIGMOID) {
+                            result = 1.0f / (1.0f + expf(-result));
+                        } else {
+                            result = ((result > 20.0f) ? result : logf(1.0f + expf(result))) * post_mul;
                         }
                     }
                 }
@@ -1334,8 +1358,12 @@ static void mul_mat_vec_q_switch_fusion(
         const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
         const uint32_t ids_stride, cudaStream_t stream) {
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+    // a post op with at most a bias runs in the plain variant
+    const bool post_only = fusion.post_op != GGML_CUDA_MM_POST_NONE && fusion.gate == nullptr && fusion.gate_bias == nullptr &&
+                           fusion.x_scale == nullptr && fusion.gate_scale == nullptr && fusion.shared_up == nullptr;
+    const bool has_fusion = !post_only && (fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr);
+    GGML_ASSERT(!post_only || c_ncols_dst == 1);
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -1481,7 +1509,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     if constexpr (mmvq_ysh_supported(type)) {
         const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr;
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr ||
+                                fusion.post_op != GGML_CUDA_MM_POST_NONE;
         if (table_id == MMVQ_PARAMETERS_VEGA20 && !has_ids && !has_fusion && ncols_dst >= 2 && ncols_dst <= 8 &&
                 ncols_x % 512 == 0) {
             mul_mat_vec_q_ysh_launch<type>(
@@ -1874,6 +1903,16 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+
+        if (fusion->post_op != GGML_CUDA_MM_POST_NONE) {
+            GGML_ASSERT(!ids && !fusion->gate && ne1 == 1 && ne2 == 1 && ne3 == 1);
+            if (fusion->post_op == GGML_CUDA_MM_POST_SOFTPLUS_MUL) {
+                GGML_ASSERT(fusion->post_mul && fusion->post_mul->type == GGML_TYPE_F32);
+                GGML_ASSERT(ggml_is_contiguous(fusion->post_mul) && ggml_nelements(fusion->post_mul) == ne0);
+                fusion_local.post_mul = (const float *) fusion->post_mul->data;
+            }
+            fusion_local.post_op = fusion->post_op;
+        }
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

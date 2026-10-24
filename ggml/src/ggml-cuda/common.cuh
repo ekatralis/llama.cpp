@@ -1588,6 +1588,13 @@ struct ggml_backend_cuda_context {
     }
 };
 
+// elementwise op applied to the matmul result after the bias (gated delta net beta/gate)
+enum ggml_cuda_mm_post_op {
+    GGML_CUDA_MM_POST_NONE         = 0,
+    GGML_CUDA_MM_POST_SIGMOID      = 1, // sigmoid(x)
+    GGML_CUDA_MM_POST_SOFTPLUS_MUL = 2, // softplus(x) * post_mul[row]
+};
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -1599,6 +1606,8 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    int post_op = GGML_CUDA_MM_POST_NONE;
+    const ggml_tensor * post_mul = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1612,6 +1621,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    int post_op = GGML_CUDA_MM_POST_NONE;
+    const float * post_mul = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {
