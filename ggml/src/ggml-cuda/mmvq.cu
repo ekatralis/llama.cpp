@@ -1178,16 +1178,17 @@ static void mul_mat_vec_q_ysh_launch(
     }
 }
 
-// gfx906, one column: each half wave owns rows_per_half rows. A half wave covers 32*vdr/qi x blocks per step,
+// gfx906, 1-4 columns: each half wave owns rows_per_half rows. A half wave covers 32*vdr/qi x blocks per step,
 // which divides the K of common shapes (20, 24, 68 superblocks), so no lanes idle in the last step.
 // The waves of a block share the LDS grid. The waves-per-EU bound lets the compiler keep all loads of a step
 // in flight; with launch bounds alone it minimizes VGPRs and serializes them. Keep the loop lean: a few more
-// live VGPRs (e.g. prefetched epilogue operands) push it past 64 and the loads get serialized again.
-#define MMVQ_HW_NWAVES 4
+// live VGPRs (e.g. prefetched epilogue operands) push it past the budget and the loads get serialized again.
+// With several columns the x loads of a row are shared by the columns (same addresses, read only).
 
-// Types with an expensive decode gain on every shape. Cheap decodes only gain with more than 5120 rows or a
-// fused gate, with fewer rows the stock kernel's 1-wave blocks keep the GPU fuller.
-static bool mmvq_hw_use(ggml_type type, int nrows_x, bool gate) {
+// One column: types with an expensive decode gain on every shape; cheap decodes only with more than 5120 rows
+// or a fused gate, with fewer rows the stock kernel's 1-wave blocks keep the GPU fuller.
+// 2-4 columns: only types with a split load / math path (mmvq_hw_split), the others stay on the ysh kernel.
+static bool mmvq_hw_use(ggml_type type, int nrows_x, int ncols_dst, bool gate) {
     if (nrows_x < 2048) {
         return false;
     }
@@ -1203,7 +1204,7 @@ static bool mmvq_hw_use(ggml_type type, int nrows_x, bool gate) {
             return true;
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_IQ4_XS:
-            return gate || nrows_x > 5120;
+            return ncols_dst > 1 || gate || nrows_x > 5120;
         default:
             return false;
     }
@@ -1227,21 +1228,178 @@ static constexpr __host__ __device__ bool mmvq_hw_supported(ggml_type type) {
     }
 }
 
+// grid / sign decodes: more ALU per byte, they prefer more waves per block and more VGPRs per row
+static constexpr __host__ __device__ bool mmvq_hw_heavy(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Split load / math for the multi-column path: all loads of a step are issued before any math (the compiler
+// otherwise interleaves them with the stock vec_dot math and serializes the rows). Same integer math as vec_dot.
+struct mmvq_hw_y {
+    int   u[8];
+    half2 ds;
+};
+
+static __device__ __forceinline__ void mmvq_hw_load_y(mmvq_hw_y & r, const block_q8_1 * __restrict__ b) {
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        r.u[k] = get_int_b4(b->qs, k);
+    }
+    r.ds = b->ds;
+}
+
+template <ggml_type type> struct mmvq_hw_split {
+    static constexpr bool available = false;
+};
+
+template <> struct mmvq_hw_split<GGML_TYPE_IQ3_S> {
+    static constexpr bool available = true;
+    struct raw {
+        int2     qs;
+        uint32_t signs;
+        uint32_t qh;
+        uint32_t scales;
+        uint32_t d;
+    };
+    static __device__ __forceinline__ int yblock(const int iqs) { return iqs/2; }
+    static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
+        const block_iq3_s * bq3 = (const block_iq3_s *) vx + kbx;
+        r.qs     = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+        r.signs  = get_int_b2(bq3->signs, iqs/2);
+        r.qh     = bq3->qh[iqs/2];
+        r.scales = bq3->scales[iqs/4];
+        r.d      = *(const uint16_t *) &bq3->d;
+    }
+    template <int ncols>
+    static __device__ __forceinline__ void dot(const raw & r, const mmvq_hw_y * y, const int iqs, const uint32_t * grid, float * out) {
+        const uint8_t * qs = (const uint8_t *) &r.qs;
+        const int qh = r.qh;
+        int sumi[ncols] = {0};
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int grid_l = iq_grid_apply_signs4(grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)], r.signs >> (4*l0 + 0));
+            const int grid_h = iq_grid_apply_signs4(grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)], r.signs >> (4*l0 + 4));
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                sumi[j] = ggml_cuda_dp4a(grid_l, y[j].u[l0 + 0], sumi[j]);
+                sumi[j] = ggml_cuda_dp4a(grid_h, y[j].u[l0 + 1], sumi[j]);
+            }
+        }
+        const int   ls = 1 + 2*((r.scales >> ((iqs << 1) & 0x04)) & 0x0F);
+        const float dx = __half2float(__ushort_as_half((unsigned short) r.d));
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            out[j] = (dx * __low2float(y[j].ds)) * (sumi[j]*ls);
+        }
+    }
+};
+
+template <> struct mmvq_hw_split<GGML_TYPE_IQ3_XXS> {
+    static constexpr bool available = true;
+    struct raw {
+        int2     q3;
+        uint32_t aux;
+        uint32_t d;
+    };
+    static __device__ __forceinline__ int yblock(const int iqs) { return iqs/2; }
+    static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
+        const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vx + kbx;
+        r.q3  = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
+        r.aux = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+        r.d   = *(const uint16_t *) &bq3->d;
+    }
+    template <int ncols>
+    static __device__ __forceinline__ void dot(const raw & r, const mmvq_hw_y * y, const int iqs, const uint32_t * grid, float * out) {
+        GGML_UNUSED(iqs);
+        const uint8_t * q3 = (const uint8_t *) &r.q3;
+        int sumi[ncols] = {0};
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const uint32_t signs = unpack_ksigns(r.aux >> (7*l0/2));
+            const int grid_l = iq_grid_apply_signs4(grid[q3[l0 + 0]], signs >> 0);
+            const int grid_h = iq_grid_apply_signs4(grid[q3[l0 + 1]], signs >> 4);
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                sumi[j] = ggml_cuda_dp4a(grid_l, y[j].u[l0 + 0], sumi[j]);
+                sumi[j] = ggml_cuda_dp4a(grid_h, y[j].u[l0 + 1], sumi[j]);
+            }
+        }
+        const int   ls = r.aux >> 28;
+        const float dx = __half2float(__ushort_as_half((unsigned short) r.d));
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            out[j] = (dx * __low2float(y[j].ds)) * ((ls*sumi[j] + sumi[j]/2)/2);
+        }
+    }
+};
+
+template <> struct mmvq_hw_split<GGML_TYPE_IQ4_XS> {
+    static constexpr bool available = true;
+    struct raw {
+        int      q[4];
+        uint32_t d_sh;      // d | scales_h << 16
+        uint32_t sl;
+    };
+    static __device__ __forceinline__ int yblock(const int iqs) { return iqs/4; }
+    static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
+        const block_iq4_xs * bq4 = (const block_iq4_xs *) vx + kbx;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            r.q[k] = get_int_b4(bq4->qs, iqs + k);
+        }
+        r.d_sh = *(const uint32_t *) bq4;
+        r.sl   = bq4->scales_l[iqs/8];
+    }
+    template <int ncols>
+    static __device__ __forceinline__ void dot(const raw & r, const mmvq_hw_y * y, const int iqs, const uint32_t * grid, float * out) {
+        GGML_UNUSED(grid);
+        int sumi[ncols] = {0};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int2 v = get_int_from_table_16(r.q[k], kvalues_iq4nl);
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                sumi[j] = ggml_cuda_dp4a(v.x, y[j].u[k + 0], sumi[j]);
+                sumi[j] = ggml_cuda_dp4a(v.y, y[j].u[k + 4], sumi[j]);
+            }
+        }
+        const int   ls = ((r.sl >> (iqs & 0x04)) & 0x0F) | (((r.d_sh >> (16 + iqs/2)) & 0x03) << 4);
+        const float dx = __half2float(__ushort_as_half((unsigned short) (r.d_sh & 0xFFFF)));
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            out[j] = (dx * __low2float(y[j].ds)) * (sumi[j]*(ls - 32));
+        }
+    }
+};
+
 #if defined(__gfx906__)
-#define MMVQ_HW_LAUNCH_BOUNDS(nthreads) __attribute__((amdgpu_flat_work_group_size(1, nthreads), amdgpu_waves_per_eu(4, 4)))
+#define MMVQ_HW_LAUNCH_BOUNDS(nthreads, wpe) __attribute__((amdgpu_flat_work_group_size(1, nthreads), amdgpu_waves_per_eu(wpe, wpe)))
 #else
-#define MMVQ_HW_LAUNCH_BOUNDS(nthreads) __launch_bounds__(nthreads, 1)
+#define MMVQ_HW_LAUNCH_BOUNDS(nthreads, wpe) __launch_bounds__(nthreads, 1)
 #endif
 
-template <ggml_type type, int nwaves, int rows_per_half, bool has_gate>
-MMVQ_HW_LAUNCH_BOUNDS(nwaves*64)
+template <ggml_type type, int ncols_dst, int nwaves, int rows_per_half, int waves_per_eu, bool has_gate>
+MMVQ_HW_LAUNCH_BOUNDS(nwaves*64, waves_per_eu)
 static __global__ void mul_mat_vec_q_hw(
         const void * __restrict__ vx, const void * __restrict__ vy, const ggml_cuda_mm_fusion_args_device fusion,
         float * __restrict__ dst, const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
         const uint32_t stride_channel_dst, const uint3 sample_ratio, const uint32_t stride_sample_x,
         const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
 #if defined(__gfx906__)
+    static_assert(!has_gate || ncols_dst == 1, "fused gate only for one column");
     constexpr int qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int qi              = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr             = get_vdr_mmvq(type);
@@ -1285,23 +1443,54 @@ static __global__ void mul_mat_vec_q_hw(
 
     [[maybe_unused]] const void * vgate = fusion.gate;
 
-    float tmp[rows_per_half]      = {0.0f};
-    float tmp_gate[rows_per_half] = {0.0f};
+    float tmp[ncols_dst][rows_per_half] = {{0.0f}};
+    float tmp_gate[rows_per_half]       = {0.0f};
 
     const int blocks_per_row_x = ncols_x/qk;
     const int kqs = vdr*(hl % lanes_per_block);
+
+    using split = mmvq_hw_split<type>;
+    if constexpr (ncols_dst > 1 && split::available) {
+        for (int kbx = hl/lanes_per_block; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            typename split::raw r[rows_per_half];
+            mmvq_hw_y           yv[ncols_dst];
+#pragma unroll
+            for (int i = 0; i < rows_per_half; ++i) {
+                split::load(r[i], vx, kbx_row[i] + kbx, kqs);
+            }
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                mmvq_hw_load_y(yv[j], y + j*stride_col_y + kbx*(qk/QK8_1) + split::yblock(kqs));
+            }
+            // keep the math below the loads
+            asm volatile("" ::: "memory");
+#pragma unroll
+            for (int i = 0; i < rows_per_half; ++i) {
+                float out[ncols_dst];
+                split::template dot<ncols_dst>(r[i], yv, kqs, grid_lds, out);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += out[j];
+                }
+            }
+        }
+    } else
     for (int kbx = hl/lanes_per_block; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const block_q8_1 * yb = y + kbx*(qk/QK8_1);
 #pragma unroll
         for (int i = 0; i < rows_per_half; ++i) {
-            if constexpr (lds_grid) {
-                tmp[i] += vec_dot_q_grid_cuda(vx, yb, kbx_row[i] + kbx, kqs, grid_lds);
-                if constexpr (has_gate) {
-                    tmp_gate[i] += vec_dot_q_grid_cuda(vgate, yb, kbx_row[i] + kbx, kqs, grid_lds);
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                if constexpr (lds_grid) {
+                    tmp[j][i] += vec_dot_q_grid_cuda(vx, yb + j*stride_col_y, kbx_row[i] + kbx, kqs, grid_lds);
+                } else {
+                    tmp[j][i] += vec_dot_q_cuda(vx, yb + j*stride_col_y, kbx_row[i] + kbx, kqs);
                 }
-            } else {
-                tmp[i] += vec_dot_q_cuda(vx, yb, kbx_row[i] + kbx, kqs);
-                if constexpr (has_gate) {
+            }
+            if constexpr (has_gate) {
+                if constexpr (lds_grid) {
+                    tmp_gate[i] += vec_dot_q_grid_cuda(vgate, yb, kbx_row[i] + kbx, kqs, grid_lds);
+                } else {
                     tmp_gate[i] += vec_dot_q_cuda(vgate, yb, kbx_row[i] + kbx, kqs);
                 }
             }
@@ -1310,77 +1499,119 @@ static __global__ void mul_mat_vec_q_hw(
 
     const uint32_t dst_off = sample_dst*stride_sample_dst + channel_dst*stride_channel_dst;
 #pragma unroll
-    for (int i = 0; i < rows_per_half; ++i) {
-        float result = warp_reduce_sum<32>(tmp[i]);
-        [[maybe_unused]] float gate_value = 0.0f;
-        if constexpr (has_gate) {
-            gate_value = warp_reduce_sum<32>(tmp_gate[i]);
-        }
-        const uint32_t row = row0 + i;
-        if (hl != i || row >= nrows_x) {
-            continue;
-        }
-        if (fusion.x_bias != nullptr) {
-            result += ((const float *) fusion.x_bias)[dst_off + row];
-        }
-        if constexpr (has_gate) {
-            if (fusion.gate_bias != nullptr) {
-                gate_value += ((const float *) fusion.gate_bias)[dst_off + row];
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_half; ++i) {
+            float result = warp_reduce_sum<32>(tmp[j][i]);
+            [[maybe_unused]] float gate_value = 0.0f;
+            if constexpr (has_gate) {
+                gate_value = warp_reduce_sum<32>(tmp_gate[i]);
             }
-            switch (fusion.glu_op) {
-                case GGML_GLU_OP_SWIGLU:
-                    result *= ggml_cuda_op_silu_single(gate_value);
-                    break;
-                case GGML_GLU_OP_GEGLU:
-                    result *= ggml_cuda_op_gelu_single(gate_value);
-                    break;
-                case GGML_GLU_OP_SWIGLU_OAI:
-                    result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
-                    break;
-                case GGML_GLU_OP_SWIGLU_CLAMP:
-                    result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, fusion.glu_limit);
-                    break;
-                default:
-                    result = result * gate_value;
-                    break;
+            const uint32_t row = row0 + i;
+            if (hl != i || row >= nrows_x) {
+                continue;
             }
-        } else if (fusion.post_op == GGML_CUDA_MM_POST_SIGMOID) {
-            result = 1.0f / (1.0f + expf(-result));
-        } else if (fusion.post_op == GGML_CUDA_MM_POST_SOFTPLUS_MUL) {
-            result = ((result > 20.0f) ? result : logf(1.0f + expf(result))) * fusion.post_mul[dst_off + row];
+            if constexpr (ncols_dst > 1) {
+                dst[dst_off + j*stride_col_dst + row] = result;
+                continue;
+            }
+            if (fusion.x_bias != nullptr) {
+                result += ((const float *) fusion.x_bias)[dst_off + row];
+            }
+            if constexpr (has_gate) {
+                if (fusion.gate_bias != nullptr) {
+                    gate_value += ((const float *) fusion.gate_bias)[dst_off + row];
+                }
+                switch (fusion.glu_op) {
+                    case GGML_GLU_OP_SWIGLU:
+                        result *= ggml_cuda_op_silu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_GEGLU:
+                        result *= ggml_cuda_op_gelu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_OAI:
+                        result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_CLAMP:
+                        result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, fusion.glu_limit);
+                        break;
+                    default:
+                        result = result * gate_value;
+                        break;
+                }
+            } else if (fusion.post_op == GGML_CUDA_MM_POST_SIGMOID) {
+                result = 1.0f / (1.0f + expf(-result));
+            } else if (fusion.post_op == GGML_CUDA_MM_POST_SOFTPLUS_MUL) {
+                result = ((result > 20.0f) ? result : logf(1.0f + expf(result))) * fusion.post_mul[dst_off + row];
+            }
+            dst[dst_off + row] = result;
         }
-        dst[dst_off + row] = result;
     }
 #else
-    GGML_UNUSED_VARS(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, channel_ratio, stride_channel_x,
-        stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    GGML_UNUSED_VARS(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio,
+        stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y,
+        stride_sample_dst);
     NO_DEVICE_CODE;
 #endif // defined(__gfx906__)
 }
 
-template <ggml_type type>
-static void mul_mat_vec_q_hw_launch(
+template <ggml_type type, int ncols_dst, int nwaves, int rph, int wpe, bool has_gate>
+static void mul_mat_vec_q_hw_launch_cfg(
         const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
-        const int ncols_x, const int nrows_x, const int stride_row_x,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
-    constexpr int nwaves = MMVQ_HW_NWAVES;
     const dim3 block_dims(64, nwaves, 1);
-    // a fused gate doubles the loads per row, so it gets half the rows
-    if (fusion.gate != nullptr) {
-        constexpr int rph = 1;
-        const dim3 block_nums((nrows_x + nwaves*2*rph - 1)/(nwaves*2*rph), nchannels_dst, nsamples_dst);
-        mul_mat_vec_q_hw<type, nwaves, rph, true><<<block_nums, block_dims, 0, stream>>>(
-            vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, channel_ratio, stride_channel_x, stride_channel_y,
-            stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
-    } else {
-        constexpr int rph = 2;
-        const dim3 block_nums((nrows_x + nwaves*2*rph - 1)/(nwaves*2*rph), nchannels_dst, nsamples_dst);
-        mul_mat_vec_q_hw<type, nwaves, rph, false><<<block_nums, block_dims, 0, stream>>>(
-            vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, channel_ratio, stride_channel_x, stride_channel_y,
-            stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    const dim3 block_nums((nrows_x + nwaves*2*rph - 1)/(nwaves*2*rph), nchannels_dst, nsamples_dst);
+    mul_mat_vec_q_hw<type, ncols_dst, nwaves, rph, wpe, has_gate><<<block_nums, block_dims, 0, stream>>>(
+        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio,
+        stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y,
+        stride_sample_dst);
+}
+
+// waves per block, rows per half wave, waves per EU (VGPR budget). More columns need more VGPRs.
+template <ggml_type type>
+static void mul_mat_vec_q_hw_launch(
+        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, const int stride_col_y,
+        const int stride_col_dst,
+        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
+#define HW_ARGS vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio, \
+    stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, \
+    stride_sample_dst, nchannels_dst, nsamples_dst, stream
+    constexpr bool heavy = mmvq_hw_heavy(type);
+    switch (ncols_dst) {
+        case 1:
+            if (fusion.gate != nullptr) {
+                mul_mat_vec_q_hw_launch_cfg<type, 1, 4, 1, 4, true>(HW_ARGS);   // the gate doubles the loads per row
+            } else {
+                mul_mat_vec_q_hw_launch_cfg<type, 1, 4, 2, 4, false>(HW_ARGS);
+            }
+            break;
+        case 2:
+            mul_mat_vec_q_hw_launch_cfg<type, 2, 4, 3, 3, false>(HW_ARGS);
+            break;
+        case 3:
+            if constexpr (heavy) {
+                mul_mat_vec_q_hw_launch_cfg<type, 3, 4, 3, 3, false>(HW_ARGS);
+            } else {
+                mul_mat_vec_q_hw_launch_cfg<type, 3, 2, 4, 2, false>(HW_ARGS);
+            }
+            break;
+        case 4:
+            if constexpr (heavy) {
+                mul_mat_vec_q_hw_launch_cfg<type, 4, 2, 4, 2, false>(HW_ARGS);
+            } else {
+                mul_mat_vec_q_hw_launch_cfg<type, 4, 2, 3, 2, false>(HW_ARGS);
+            }
+            break;
+        default:
+            GGML_ABORT("fatal error");
     }
+#undef HW_ARGS
 }
 
 // Dedicated MoE multi-token kernel.
@@ -1712,6 +1943,24 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return idle * 8 <= iters_wide * 2;
     };
 
+    if constexpr (mmvq_hw_supported(type)) {
+        static const bool hw_disabled = getenv("GGML_CUDA_NO_MMVQ_HW") != nullptr;
+        const bool hw_fusion_ok = fusion.shared_up == nullptr && fusion.x_scale == nullptr && fusion.gate_scale == nullptr &&
+                                  (fusion.gate == nullptr || fusion.post_op == GGML_CUDA_MM_POST_NONE) &&
+                                  (ncols_dst == 1 || (fusion.gate == nullptr && fusion.x_bias == nullptr &&
+                                                      fusion.gate_bias == nullptr && fusion.post_op == GGML_CUDA_MM_POST_NONE));
+        if (!hw_disabled && table_id == MMVQ_PARAMETERS_VEGA20 && !has_ids && hw_fusion_ok &&
+                (ncols_dst == 1 || (ncols_dst <= 4 && mmvq_hw_split<type>::available)) &&
+                mmvq_hw_use(type, nrows_x, ncols_dst, fusion.gate != nullptr)) {
+            mul_mat_vec_q_hw_launch<type>(
+                vx, vy, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                nchannels_dst, nsamples_dst, stream);
+            return;
+        }
+    }
+
     if constexpr (mmvq_ysh_supported(type)) {
         const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                                 fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr ||
@@ -1720,21 +1969,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 ncols_x % 512 == 0) {
             mul_mat_vec_q_ysh_launch<type>(
                 vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
-                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                nchannels_dst, nsamples_dst, stream);
-            return;
-        }
-    }
-
-    if constexpr (mmvq_hw_supported(type)) {
-        static const bool hw_disabled = getenv("GGML_CUDA_NO_MMVQ_HW") != nullptr;
-        const bool hw_fusion_ok = fusion.shared_up == nullptr && fusion.x_scale == nullptr && fusion.gate_scale == nullptr &&
-                                  (fusion.gate == nullptr || fusion.post_op == GGML_CUDA_MM_POST_NONE);
-        if (!hw_disabled && table_id == MMVQ_PARAMETERS_VEGA20 && ncols_dst == 1 && !has_ids && hw_fusion_ok &&
-                mmvq_hw_use(type, nrows_x, fusion.gate != nullptr)) {
-            mul_mat_vec_q_hw_launch<type>(
-                vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x,
                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                 nchannels_dst, nsamples_dst, stream);
