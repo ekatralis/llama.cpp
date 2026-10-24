@@ -179,6 +179,30 @@ static __global__ void concat_dim0_src1_t(
     }
 }
 
+// dim 0 concat with a narrow dst (ne0 < 64, e.g. the ssm_conv input for a few tokens):
+// one thread per element so that blocks are not mostly idle
+template <typename T>
+static __global__ void concat_dim0_narrow(
+        const char * src0, const char * src1, char * dst,
+        const int ne00, const int ne0, const int ne1,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const uint64_t nb0,  const uint64_t nb1,  const uint64_t nb2,  const uint64_t nb3) {
+    const int idx = blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= ne0*ne1) {
+        return;
+    }
+    const int     i1 = idx / ne0;
+    const int     i0 = idx - i1*ne0;
+    const int64_t i2 = blockIdx.y;
+    const int64_t i3 = blockIdx.z;
+
+    const T * x = i0 < ne00 ?
+        (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00) :
+        (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+    *((T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0)) = *x;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -207,6 +231,15 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         concat_dim0_src1_t<T><<<grid_dim, block_dim, 0, stream>>>(
             (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
             src0->ne[0], dst->ne[0], dst->ne[1], dst->ne[2],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->nb[0],  dst->nb[1],  dst->nb[2],  dst->nb[3]);
+    } else if (dim == 0 && dst->ne[0] < 2*CUDA_CONCAT_TILE && dst->ne[0]*dst->ne[1] <= INT_MAX && !ggml_is_quantized(src0->type)) {
+        const int64_t n = dst->ne[0]*dst->ne[1];
+        const dim3 grid_dim((n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE, dst->ne[2], dst->ne[3]);
+        concat_dim0_narrow<T><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            (int) src0->ne[0], (int) dst->ne[0], (int) dst->ne[1],
             src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
             src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
             dst->nb[0],  dst->nb[1],  dst->nb[2],  dst->nb[3]);
