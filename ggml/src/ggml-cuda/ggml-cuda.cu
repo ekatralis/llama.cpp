@@ -4584,6 +4584,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // gated delta net beta and alpha, 1-4 tokens: both mat-vecs and their epilogues in one launch
+    // beta: mul_mat + reshape + sigmoid, alpha: mul_mat + reshape + add(bias) + softplus + mul(vec)
+    // gated delta net alpha and beta (graph order), 1-4 tokens: both mat-vecs and their epilogues in one launch
+    // alpha: mul_mat + reshape + add(bias) + softplus + mul(vec) + reshape, beta: mul_mat + reshape + sigmoid
+    if (node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && i + 9 <= cgraph->n_nodes) {
+        const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
+                                GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY };
+        const int outputs[] = { i + 4, i + 5, i + 8 };
+        ggml_tensor * const * n = cgraph->nodes + i;
+        if (ggml_can_fuse_subgraph(cgraph, i, 9, ops, outputs, 3) &&
+                ggml_get_unary_op(n[3]) == GGML_UNARY_OP_SOFTPLUS && ggml_get_unary_op(n[8]) == GGML_UNARY_OP_SIGMOID &&
+                n[1]->src[0] == n[0] && n[3]->src[0] == n[2] && n[5]->src[0] == n[4] &&
+                n[7]->src[0] == n[6] && n[8]->src[0] == n[7] &&
+                n[6]->src[1] == n[0]->src[1] && n[6]->src[2] == nullptr &&
+                ggml_cuda_mul_mat_vec_q_gdn_pair_supported(n[6]->src[0], n[0]->src[0], n[0]->src[1])) {
+            const ggml_tensor * bias = n[2]->src[0] == n[1] ? n[2]->src[1] : n[2]->src[1] == n[1] ? n[2]->src[0] : nullptr;
+            const ggml_tensor * vec  = n[4]->src[0] == n[3] ? n[4]->src[1] : n[4]->src[1] == n[3] ? n[4]->src[0] : nullptr;
+            const int64_t nrows = n[0]->ne[0];
+            const bool ok = bias && vec && bias->type == GGML_TYPE_F32 && vec->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(bias) && ggml_is_contiguous(vec) &&
+                bias->ne[0] == nrows && ggml_nelements(bias) == nrows && vec->ne[0] == nrows && ggml_nelements(vec) == nrows &&
+                n[4]->type == GGML_TYPE_F32 && n[8]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(n[4]) && ggml_is_contiguous(n[8]) &&
+                ggml_nelements(n[4]) == ggml_nelements(n[0]) && ggml_nelements(n[8]) == ggml_nelements(n[6]) &&
+                ggml_is_contiguous(n[0]) && ggml_is_contiguous(n[6]) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, outputs, 3);
+            if (ok) {
+                ggml_cuda_mul_mat_vec_q_gdn_pair(*cuda_ctx, n[6]->src[0], n[0]->src[0], n[0]->src[1],
+                    (float *) n[8]->data, (float *) n[4]->data, (const float *) bias->data, (const float *) vec->data);
+                return 8;
+            }
+        }
+    }
+
     // mul_mat [+ reshape] + add + softplus + mul, mul_mat [+ reshape] + sigmoid (gated delta net gate and beta):
     // done in the MMVQ epilogue
     if (node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && ggml_cuda_should_fuse_mul_mat_vec_q(node)) {

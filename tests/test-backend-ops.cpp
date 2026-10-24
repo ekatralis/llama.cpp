@@ -4320,6 +4320,65 @@ struct test_unary_mul : public test_case {
     }
 };
 
+// Delta-net alpha / beta projections of one activation, in the Qwen3.5 graph order: mul_mat + reshape +
+// add(dt) + softplus + mul(a) + reshape and mul_mat + reshape + sigmoid (some backends run both in one launch).
+struct test_gdn_beta_alpha : public test_case {
+    const ggml_type type;
+    const int64_t n_heads;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    ggml_tensor * beta  = nullptr;
+    ggml_tensor * alpha = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_BETA_ALPHA";
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { beta, alpha }; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_heads, n_embd, n_tokens);
+    }
+
+    test_gdn_beta_alpha(ggml_type type = GGML_TYPE_Q8_0, int64_t n_heads = 48, int64_t n_embd = 5120, int64_t n_tokens = 1)
+        : type(type), n_heads(n_heads), n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, type, n_embd, n_heads);
+        ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, type, n_embd, n_heads);
+        ggml_tensor * x       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_heads);
+        ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_heads);
+        ggml_set_name(w_beta, "w_beta");
+        ggml_set_name(w_alpha, "w_alpha");
+        ggml_set_name(x, "x");
+        ggml_set_name(dt, "dt");
+        ggml_set_name(a, "a");
+
+        // alpha first, as in the model graph
+        alpha = ggml_mul_mat(ctx, w_alpha, x);
+        alpha = ggml_reshape_3d(ctx, alpha, n_heads, n_tokens, 1);
+        alpha = ggml_add(ctx, alpha, dt);
+        alpha = ggml_softplus(ctx, alpha);
+        alpha = ggml_mul(ctx, alpha, a);
+        ggml_set_name(alpha, "alpha");
+        ggml_tensor * gate = ggml_reshape_4d(ctx, alpha, 1, n_heads, n_tokens, 1);
+
+        beta = ggml_mul_mat(ctx, w_beta, x);
+        beta = ggml_reshape_4d(ctx, beta, 1, n_heads, n_tokens, 1);
+        beta = ggml_sigmoid(ctx, beta);
+        ggml_set_name(beta, "beta");
+
+        // one output node that depends on both
+        ggml_tensor * out = ggml_add(ctx, gate, beta);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_UNARY(SILU|SIGMOID|SOFTPLUS) + GGML_OP_MUL with the ADD's bias and
 // the MUL's scale broadcast over dim 0: the delta-net alpha gate, softplus(alpha + dt) * a_coeff.
 struct test_add_unary_mul : public test_case {
@@ -10009,6 +10068,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
+
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t n_tokens : { 1, 2, 3, 4, 5 }) {
+            test_cases.emplace_back(new test_gdn_beta_alpha(type, 48, 5120, n_tokens));
+        }
+        test_cases.emplace_back(new test_gdn_beta_alpha(type, 32, 1024, 3));
+    }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
