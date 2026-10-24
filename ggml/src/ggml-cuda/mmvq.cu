@@ -1188,6 +1188,7 @@ static void mul_mat_vec_q_ysh_launch(
 // One column: types with an expensive decode gain on every shape; cheap decodes only with more than 5120 rows
 // or a fused gate, with fewer rows the stock kernel's 1-wave blocks keep the GPU fuller.
 // 2-4 columns: only types with a split load / math path (mmvq_hw_split), the others stay on the ysh kernel.
+// Q5_K: 2-4 columns with many rows (output head), with fewer rows the ysh kernel is faster.
 static bool mmvq_hw_use(ggml_type type, int nrows_x, int ncols_dst, bool gate) {
     if (nrows_x < 2048) {
         return false;
@@ -1205,6 +1206,8 @@ static bool mmvq_hw_use(ggml_type type, int nrows_x, int ncols_dst, bool gate) {
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_IQ4_XS:
             return ncols_dst > 1 || gate || nrows_x > 5120;
+        case GGML_TYPE_Q5_K:
+            return ncols_dst > 1 && nrows_x >= 16384;
         default:
             return false;
     }
@@ -1214,6 +1217,7 @@ static constexpr __host__ __device__ bool mmvq_hw_supported(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q5_K:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ2_XXS:
@@ -1259,12 +1263,21 @@ static __device__ __forceinline__ void mmvq_hw_load_y(mmvq_hw_y & r, const block
     r.ds = b->ds;
 }
 
+// grid_size: uint32 words of the grid table the dot reads from LDS (0: none)
 template <ggml_type type> struct mmvq_hw_split {
     static constexpr bool available = false;
+    static constexpr int  grid_size = 0;
+    static __device__ __forceinline__ const uint32_t * grid() { return nullptr; }
 };
 
 template <> struct mmvq_hw_split<GGML_TYPE_IQ3_S> {
     static constexpr bool available = true;
+    static constexpr int  grid_size = 512;
+    static __device__ __forceinline__ const uint32_t * grid() { return iq3s_grid; }
+    using ys = mmvq_hw_y;
+    static __device__ __forceinline__ void load_y(ys & r, const block_q8_1 * __restrict__ yb, const int iqs) {
+        mmvq_hw_load_y(r, yb + iqs/2);
+    }
     struct raw {
         int2     qs;
         uint32_t signs;
@@ -1272,7 +1285,6 @@ template <> struct mmvq_hw_split<GGML_TYPE_IQ3_S> {
         uint32_t scales;
         uint32_t d;
     };
-    static __device__ __forceinline__ int yblock(const int iqs) { return iqs/2; }
     static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
         const block_iq3_s * bq3 = (const block_iq3_s *) vx + kbx;
         r.qs     = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
@@ -1282,7 +1294,7 @@ template <> struct mmvq_hw_split<GGML_TYPE_IQ3_S> {
         r.d      = *(const uint16_t *) &bq3->d;
     }
     template <int ncols>
-    static __device__ __forceinline__ void dot(const raw & r, const mmvq_hw_y * y, const int iqs, const uint32_t * grid, float * out) {
+    static __device__ __forceinline__ void dot(const raw & r, const ys * y, const int iqs, const uint32_t * grid, float * out) {
         const uint8_t * qs = (const uint8_t *) &r.qs;
         const int qh = r.qh;
         int sumi[ncols] = {0};
@@ -1307,12 +1319,17 @@ template <> struct mmvq_hw_split<GGML_TYPE_IQ3_S> {
 
 template <> struct mmvq_hw_split<GGML_TYPE_IQ3_XXS> {
     static constexpr bool available = true;
+    static constexpr int  grid_size = 256;
+    static __device__ __forceinline__ const uint32_t * grid() { return iq3xxs_grid; }
+    using ys = mmvq_hw_y;
+    static __device__ __forceinline__ void load_y(ys & r, const block_q8_1 * __restrict__ yb, const int iqs) {
+        mmvq_hw_load_y(r, yb + iqs/2);
+    }
     struct raw {
         int2     q3;
         uint32_t aux;
         uint32_t d;
     };
-    static __device__ __forceinline__ int yblock(const int iqs) { return iqs/2; }
     static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
         const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vx + kbx;
         r.q3  = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
@@ -1320,7 +1337,7 @@ template <> struct mmvq_hw_split<GGML_TYPE_IQ3_XXS> {
         r.d   = *(const uint16_t *) &bq3->d;
     }
     template <int ncols>
-    static __device__ __forceinline__ void dot(const raw & r, const mmvq_hw_y * y, const int iqs, const uint32_t * grid, float * out) {
+    static __device__ __forceinline__ void dot(const raw & r, const ys * y, const int iqs, const uint32_t * grid, float * out) {
         GGML_UNUSED(iqs);
         const uint8_t * q3 = (const uint8_t *) &r.q3;
         int sumi[ncols] = {0};
@@ -1346,12 +1363,17 @@ template <> struct mmvq_hw_split<GGML_TYPE_IQ3_XXS> {
 
 template <> struct mmvq_hw_split<GGML_TYPE_IQ4_XS> {
     static constexpr bool available = true;
+    static constexpr int  grid_size = 0;
+    static __device__ __forceinline__ const uint32_t * grid() { return nullptr; }
+    using ys = mmvq_hw_y;
+    static __device__ __forceinline__ void load_y(ys & r, const block_q8_1 * __restrict__ yb, const int iqs) {
+        mmvq_hw_load_y(r, yb + iqs/4);
+    }
     struct raw {
         int      q[4];
         uint32_t d_sh;      // d | scales_h << 16
         uint32_t sl;
     };
-    static __device__ __forceinline__ int yblock(const int iqs) { return iqs/4; }
     static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
         const block_iq4_xs * bq4 = (const block_iq4_xs *) vx + kbx;
 #pragma unroll
@@ -1362,7 +1384,7 @@ template <> struct mmvq_hw_split<GGML_TYPE_IQ4_XS> {
         r.sl   = bq4->scales_l[iqs/8];
     }
     template <int ncols>
-    static __device__ __forceinline__ void dot(const raw & r, const mmvq_hw_y * y, const int iqs, const uint32_t * grid, float * out) {
+    static __device__ __forceinline__ void dot(const raw & r, const ys * y, const int iqs, const uint32_t * grid, float * out) {
         GGML_UNUSED(grid);
         int sumi[ncols] = {0};
 #pragma unroll
@@ -1379,6 +1401,371 @@ template <> struct mmvq_hw_split<GGML_TYPE_IQ4_XS> {
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
             out[j] = (dx * __low2float(y[j].ds)) * (sumi[j]*(ls - 32));
+        }
+    }
+};
+
+template <> struct mmvq_hw_split<GGML_TYPE_IQ2_XXS> {
+    static constexpr bool available = true;
+    static constexpr int  grid_size = 2*256;
+    static __device__ __forceinline__ const uint32_t * grid() { return (const uint32_t *) iq2xxs_grid; }
+    using ys = mmvq_hw_y;
+    struct raw {
+        uint32_t q2;
+        uint32_t aux;
+        uint32_t d;
+    };
+    static __device__ __forceinline__ void load_y(ys & r, const block_q8_1 * __restrict__ yb, const int iqs) {
+        mmvq_hw_load_y(r, yb + iqs/2);
+    }
+    static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
+        const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vx + kbx;
+        r.q2  = get_int_b2(bq2->qs, iqs);
+        r.aux = get_int_b2(bq2->qs, iqs + 1);
+        r.d   = *(const uint16_t *) &bq2->d;
+    }
+    template <int ncols>
+    static __device__ __forceinline__ void dot(const raw & r, const ys * y, const int iqs, const uint32_t * grid, float * out) {
+        GGML_UNUSED(iqs);
+        const uint8_t * aux8 = (const uint8_t *) &r.q2;
+        int sumi[ncols] = {0};
+#pragma unroll
+        for (int k0 = 0; k0 < 8; k0 += 2) {
+            const uint2    grid_pos = ((const uint2 *) grid)[aux8[k0/2]];
+            const uint32_t signs    = unpack_ksigns(r.aux >> (7*k0/2));
+            const int grid0 = iq_grid_apply_signs4(grid_pos.x, signs >> 0);
+            const int grid1 = iq_grid_apply_signs4(grid_pos.y, signs >> 4);
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                sumi[j] = ggml_cuda_dp4a(grid0, y[j].u[k0 + 0], sumi[j]);
+                sumi[j] = ggml_cuda_dp4a(grid1, y[j].u[k0 + 1], sumi[j]);
+            }
+        }
+        const int   ls = r.aux >> 27 | 1;
+        const float dx = __half2float(__ushort_as_half((unsigned short) r.d));
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            out[j] = (dx * __low2float(y[j].ds)) * (sumi[j]*ls/8);
+        }
+    }
+};
+
+template <> struct mmvq_hw_split<GGML_TYPE_IQ2_XS> {
+    static constexpr bool available = true;
+    static constexpr int  grid_size = 2*512;
+    static __device__ __forceinline__ const uint32_t * grid() { return (const uint32_t *) iq2xs_grid; }
+    using ys = mmvq_hw_y;
+    struct raw {
+        int2     q2;
+        uint32_t sc;
+        uint32_t d;
+    };
+    static __device__ __forceinline__ void load_y(ys & r, const block_q8_1 * __restrict__ yb, const int iqs) {
+        mmvq_hw_load_y(r, yb + iqs/2);
+    }
+    static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
+        const block_iq2_xs * bq2 = (const block_iq2_xs *) vx + kbx;
+        r.q2 = make_int2(get_int_b2(bq2->qs, iqs + 0), get_int_b2(bq2->qs, iqs + 1));
+        r.sc = bq2->scales[iqs/2];
+        r.d  = *(const uint16_t *) &bq2->d;
+    }
+    template <int ncols>
+    static __device__ __forceinline__ void dot(const raw & r, const ys * y, const int iqs, const uint32_t * grid, float * out) {
+        GGML_UNUSED(iqs);
+        const uint16_t * q2 = (const uint16_t *) &r.q2;
+        int sumi0[ncols] = {0};
+        int sumi1[ncols] = {0};
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const uint2    grid_pos = ((const uint2 *) grid)[q2[l0/2] & 0x1FF];
+            const uint32_t signs    = unpack_ksigns(q2[l0/2] >> 9);
+            const int grid_l = iq_grid_apply_signs4(grid_pos.x, signs >> 0);
+            const int grid_h = iq_grid_apply_signs4(grid_pos.y, signs >> 4);
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                int & s = l0 < 4 ? sumi0[j] : sumi1[j];
+                s = ggml_cuda_dp4a(grid_l, y[j].u[l0 + 0], s);
+                s = ggml_cuda_dp4a(grid_h, y[j].u[l0 + 1], s);
+            }
+        }
+        const int   ls0 = r.sc & 0x0F;
+        const int   ls1 = r.sc >> 4;
+        const float dx  = __half2float(__ushort_as_half((unsigned short) r.d));
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const int sumi = (sumi0[j]*ls0 + sumi1[j]*ls1 + (sumi0[j] + sumi1[j])/2)/4;
+            out[j] = (dx * __low2float(y[j].ds)) * sumi;
+        }
+    }
+};
+
+template <> struct mmvq_hw_split<GGML_TYPE_IQ2_S> {
+    static constexpr bool available = true;
+    static constexpr int  grid_size = 2*1024;
+    static __device__ __forceinline__ const uint32_t * grid() { return (const uint32_t *) iq2s_grid; }
+    using ys = mmvq_hw_y;
+    struct raw {
+        uint32_t qs;
+        uint32_t signs;
+        uint32_t qh;
+        uint32_t sc;
+        uint32_t d;
+    };
+    static __device__ __forceinline__ void load_y(ys & r, const block_q8_1 * __restrict__ yb, const int iqs) {
+        mmvq_hw_load_y(r, yb + iqs/2);
+    }
+    static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
+        const block_iq2_s * bq2 = (const block_iq2_s *) vx + kbx;
+        r.qs    = get_int_b2(bq2->qs, iqs/2);
+        r.signs = get_int_b2(bq2->qs, QK_K/32 + iqs/2);
+        r.qh    = bq2->qh[iqs/2];
+        r.sc    = bq2->scales[iqs/2];
+        r.d     = *(const uint16_t *) &bq2->d;
+    }
+    template <int ncols>
+    static __device__ __forceinline__ void dot(const raw & r, const ys * y, const int iqs, const uint32_t * grid, float * out) {
+        GGML_UNUSED(iqs);
+        const uint8_t * qs = (const uint8_t *) &r.qs;
+        const int qh = r.qh;
+        int sumi0[ncols] = {0};
+        int sumi1[ncols] = {0};
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const uint2 grid_pos = ((const uint2 *) grid)[qs[l0/2] | ((qh << (8 - l0)) & 0x300)];
+            const int grid_l = iq_grid_apply_signs4(grid_pos.x, r.signs >> (4*l0 + 0));
+            const int grid_h = iq_grid_apply_signs4(grid_pos.y, r.signs >> (4*l0 + 4));
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                int & s = l0 < 4 ? sumi0[j] : sumi1[j];
+                s = ggml_cuda_dp4a(grid_l, y[j].u[l0 + 0], s);
+                s = ggml_cuda_dp4a(grid_h, y[j].u[l0 + 1], s);
+            }
+        }
+        const int   ls0 = r.sc & 0x0F;
+        const int   ls1 = r.sc >> 4;
+        const float dx  = __half2float(__ushort_as_half((unsigned short) r.d));
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const int sumi = (sumi0[j]*ls0 + sumi1[j]*ls1 + (sumi0[j] + sumi1[j])/2)/4;
+            out[j] = (dx * __low2float(y[j].ds)) * sumi;
+        }
+    }
+};
+
+// Q2_K / Q3_K: 2 ints from each of 4 q8_1 blocks
+struct mmvq_hw_y4 {
+    int   u[8];
+    half2 ds[4];
+};
+
+static __device__ __forceinline__ void mmvq_hw_load_y4(mmvq_hw_y4 & r, const block_q8_1 * __restrict__ yb, const int iqs) {
+    const int bq8_offset = 4*(iqs/8);
+    const int iqs8       = iqs % QI8_1;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        r.u[2*i + 0] = get_int_b4(yb[bq8_offset + i].qs, iqs8 + 0);
+        r.u[2*i + 1] = get_int_b4(yb[bq8_offset + i].qs, iqs8 + 1);
+        r.ds[i]      = yb[bq8_offset + i].ds;
+    }
+}
+
+// Q5_K: 2 ints from each of 2 q8_1 blocks
+struct mmvq_hw_y2 {
+    int   u[4];
+    half2 ds[2];
+};
+
+static __device__ __forceinline__ void mmvq_hw_load_y2(mmvq_hw_y2 & r, const block_q8_1 * __restrict__ yb, const int iqs) {
+    const int bq8_offset = 2*(iqs/8);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int * q8 = (const int *) yb[bq8_offset + i].qs + (iqs/2)%4;
+        r.u[2*i + 0] = q8[0];
+        r.u[2*i + 1] = q8[4];
+        r.ds[i]      = yb[bq8_offset + i].ds;
+    }
+}
+
+template <> struct mmvq_hw_split<GGML_TYPE_Q2_K> {
+    static constexpr bool available = true;
+    static constexpr int  grid_size = 0;
+    static __device__ __forceinline__ const uint32_t * grid() { return nullptr; }
+    using ys = mmvq_hw_y4;
+    struct raw {
+        int      v[2];
+        int      sc[2];
+        uint32_t dm;
+    };
+    static __device__ __forceinline__ void load_y(ys & r, const block_q8_1 * __restrict__ yb, const int iqs) {
+        mmvq_hw_load_y4(r, yb, iqs);
+    }
+    static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
+        const block_q2_K * bq2 = (const block_q2_K *) vx + kbx;
+        r.v[0]  = get_int_b4(bq2->qs, iqs + 0);
+        r.v[1]  = get_int_b4(bq2->qs, iqs + 1);
+        r.sc[0] = get_int_b4(bq2->scales, 2*(iqs/QI8_1) + 0);
+        r.sc[1] = get_int_b4(bq2->scales, 2*(iqs/QI8_1) + 1);
+        r.dm    = *(const uint32_t *) &bq2->dm;
+    }
+    template <int ncols>
+    static __device__ __forceinline__ void dot(const raw & r, const ys * y, const int iqs, const uint32_t * grid, float * out) {
+        GGML_UNUSED(grid);
+        const int sc_shift = 8*((iqs % QI8_1)/(QI8_1/2));
+        float sumf_d[ncols] = {0.0f};
+        float sumf_m[ncols] = {0.0f};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int sc = (r.sc[i/2] >> sc_shift) >> (16*(i%2));
+            const int v0 = (r.v[0] >> (2*i)) & 0x03030303;
+            const int v1 = (r.v[1] >> (2*i)) & 0x03030303;
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                int sumi_d = ggml_cuda_dp4a(v0, y[j].u[2*i + 0], 0);
+                sumi_d     = ggml_cuda_dp4a(v1, y[j].u[2*i + 1], sumi_d);
+                int sumi_m = ggml_cuda_dp4a(0x01010101, y[j].u[2*i + 0], 0);
+                sumi_m     = ggml_cuda_dp4a(0x01010101, y[j].u[2*i + 1], sumi_m);
+                const float d8 = __low2float(y[j].ds[i]);
+                sumf_d[j] += d8 * (sumi_d * (sc & 0xF));
+                sumf_m[j] += d8 * (sumi_m * ((sc >> 4) & 0xF));
+            }
+        }
+        const float2 dm = __half22float2(*(const half2 *) &r.dm);
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            out[j] = dm.x*sumf_d[j] - dm.y*sumf_m[j];
+        }
+    }
+};
+
+template <> struct mmvq_hw_split<GGML_TYPE_Q3_K> {
+    static constexpr bool available = true;
+    static constexpr int  grid_size = 0;
+    static __device__ __forceinline__ const uint32_t * grid() { return nullptr; }
+    using ys = mmvq_hw_y4;
+    struct raw {
+        int      vl[2];
+        int      vh[2];
+        int      sc[3];
+        uint32_t d;
+    };
+    static __device__ __forceinline__ void load_y(ys & r, const block_q8_1 * __restrict__ yb, const int iqs) {
+        mmvq_hw_load_y4(r, yb, iqs);
+    }
+    static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
+        const block_q3_K * bq3 = (const block_q3_K *) vx + kbx;
+        const int iqs8 = iqs % QI8_1;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            r.vl[j] = get_int_b2(bq3->qs, iqs + j);
+            r.vh[j] = get_int_b2(bq3->hmask, iqs8 + j);
+        }
+#pragma unroll
+        for (int l = 0; l < 3; ++l) {
+            r.sc[l] = get_int_b2(bq3->scales, l);
+        }
+        r.d = *(const uint16_t *) &bq3->d;
+    }
+    template <int ncols>
+    static __device__ __forceinline__ void dot(const raw & r, const ys * y, const int iqs, const uint32_t * grid, float * out) {
+        GGML_UNUSED(grid);
+        const int bq8_offset = 4*(iqs/8);
+        const int sc_shift   = 8*((iqs % QI8_1)/(QI8_1/2)) + 4*(iqs/(QI3_K/2));
+        float sumf[ncols] = {0.0f};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int sc_low  = ((r.sc[i/2] >> sc_shift) >> (16*(i%2))) & 0x0F;
+            const int sc_high = ((r.sc[2] >> sc_shift) >> (16*(i%2) + 2*(i/2))) & 0x03;
+            const int sc      = (sc_low | (sc_high << 4)) - 32;
+            int v[2];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int vil = (r.vl[k] >> (2*i)) & 0x03030303;
+                const int vih = (((r.vh[k] >> bq8_offset) >> i) << 2) & 0x04040404;
+                v[k] = vil | vih;
+            }
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                int sumi = 0;
+#pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    sumi = ggml_cuda_dp4a(v[k],       y[j].u[2*i + k], sumi);
+                    sumi = ggml_cuda_dp4a(0xFCFCFCFC, y[j].u[2*i + k], sumi);
+                }
+                sumf[j] += __low2float(y[j].ds[i]) * (sumi * sc);
+            }
+        }
+        const float d = __half2float(__ushort_as_half((unsigned short) r.d));
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            out[j] = d * sumf[j];
+        }
+    }
+};
+
+// Q5_K scales and mins of the two sub-blocks of this lane, from the 16 byte block header
+static __device__ __forceinline__ void mmvq_hw_k4_scales(const int4 & hdr, const int iqs, uint8_t * sc, uint8_t * m) {
+    const int j  = iqs/8;
+    const int jm = j & 1;
+    const uint32_t s0 = ((uint32_t) hdr.y >> (16*jm)) & 0xFFFF;
+    const uint32_t s2 = ((uint32_t) hdr.z >> (16*jm)) & 0xFFFF;
+    const uint32_t s4 = ((uint32_t) hdr.w >> (16*jm)) & 0xFFFF;
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+    const uint8_t * a = (const uint8_t *) aux;
+    sc[0] = a[0]; sc[1] = a[1];
+    m[0]  = a[2]; m[1]  = a[3];
+}
+
+template <> struct mmvq_hw_split<GGML_TYPE_Q5_K> {
+    static constexpr bool available = true;
+    static constexpr int  grid_size = 0;
+    static __device__ __forceinline__ const uint32_t * grid() { return nullptr; }
+    using ys = mmvq_hw_y2;
+    struct raw {
+        int4 hdr;   // dm, scales
+        int  vl[2];
+        int  vh[2];
+    };
+    static __device__ __forceinline__ void load_y(ys & r, const block_q8_1 * __restrict__ yb, const int iqs) {
+        mmvq_hw_load_y2(r, yb, iqs);
+    }
+    static __device__ __forceinline__ void load(raw & r, const void * __restrict__ vx, const int kbx, const int iqs) {
+        const block_q5_K * bq5 = (const block_q5_K *) vx + kbx;
+        r.hdr = *(const int4 *) bq5;
+        const int * ql = (const int *) (bq5->qs + 16*(2*(iqs/8)) + 4*((iqs/2)%4));
+        const int * qh = (const int *) (bq5->qh + 4*((iqs/2)%4));
+        r.vl[0] = ql[0];
+        r.vl[1] = ql[4];
+        r.vh[0] = qh[0];
+        r.vh[1] = qh[4];
+    }
+    template <int ncols>
+    static __device__ __forceinline__ void dot(const raw & r, const ys * y, const int iqs, const uint32_t * grid, float * out) {
+        GGML_UNUSED(grid);
+        const int bq8_offset = 2*(iqs/8);
+        uint8_t sc[2], m[2];
+        mmvq_hw_k4_scales(r.hdr, iqs, sc, m);
+        float sumf_d[ncols] = {0.0f};
+        float sumf_m[ncols] = {0.0f};
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int v0i = ((r.vl[0] >> (4*i)) & 0x0F0F0F0F) | ((((r.vh[0] >> bq8_offset) >> i) << 4) & 0x10101010);
+            const int v1i = ((r.vl[1] >> (4*i)) & 0x0F0F0F0F) | ((((r.vh[1] >> bq8_offset) >> i) << 4) & 0x10101010);
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                const int dot1 = ggml_cuda_dp4a(v0i, y[j].u[2*i + 0], ggml_cuda_dp4a(v1i, y[j].u[2*i + 1], 0));
+                const int dot2 = ggml_cuda_dp4a(0x01010101, y[j].u[2*i + 0], ggml_cuda_dp4a(0x01010101, y[j].u[2*i + 1], 0));
+                const float d8 = __low2float(y[j].ds[i]);
+                sumf_d[j] += d8 * (dot1 * sc[i]);
+                sumf_m[j] += d8 * (dot2 * m[i]);
+            }
+        }
+        const float2 dm = __half22float2(*(const half2 *) &r.hdr.x);
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            out[j] = dm.x*sumf_d[j] - dm.y*sumf_m[j];
         }
     }
 };
@@ -1429,12 +1816,14 @@ static __global__ void mul_mat_vec_q_hw(
         kbx_row[i] = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
     }
 
-    constexpr int  grid_size = mmvq_lds_grid_size(type);
+    using split = mmvq_hw_split<type>;
+    constexpr bool use_split = ncols_dst > 1 && split::available;
+    constexpr int  grid_size = use_split ? split::grid_size : mmvq_lds_grid_size(type);
     constexpr bool lds_grid  = grid_size > 0;
     constexpr vec_dot_q_grid_cuda_t vec_dot_q_grid_cuda = get_vec_dot_q_grid_cuda(type);
     __shared__ __align__(16) uint32_t grid_lds[lds_grid ? grid_size : 1];
     if constexpr (lds_grid) {
-        const uint32_t * grid = get_iq_grid(type);
+        const uint32_t * grid = use_split ? split::grid() : get_iq_grid(type);
         for (int i = tid; i < grid_size; i += nwaves*64) {
             grid_lds[i] = grid[i];
         }
@@ -1449,18 +1838,17 @@ static __global__ void mul_mat_vec_q_hw(
     const int blocks_per_row_x = ncols_x/qk;
     const int kqs = vdr*(hl % lanes_per_block);
 
-    using split = mmvq_hw_split<type>;
-    if constexpr (ncols_dst > 1 && split::available) {
+    if constexpr (use_split) {
         for (int kbx = hl/lanes_per_block; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
             typename split::raw r[rows_per_half];
-            mmvq_hw_y           yv[ncols_dst];
+            typename split::ys  yv[ncols_dst];
 #pragma unroll
             for (int i = 0; i < rows_per_half; ++i) {
                 split::load(r[i], vx, kbx_row[i] + kbx, kqs);
             }
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
-                mmvq_hw_load_y(yv[j], y + j*stride_col_y + kbx*(qk/QK8_1) + split::yblock(kqs));
+                split::load_y(yv[j], y + j*stride_col_y + kbx*(qk/QK8_1), kqs);
             }
             // keep the math below the loads
             asm volatile("" ::: "memory");
@@ -1583,6 +1971,7 @@ static void mul_mat_vec_q_hw_launch(
     stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, \
     stride_sample_dst, nchannels_dst, nsamples_dst, stream
     constexpr bool heavy = mmvq_hw_heavy(type);
+    constexpr bool k23   = type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K;   // 4 y blocks per lane, more VGPRs
     switch (ncols_dst) {
         case 1:
             if (fusion.gate != nullptr) {
@@ -1592,10 +1981,16 @@ static void mul_mat_vec_q_hw_launch(
             }
             break;
         case 2:
-            mul_mat_vec_q_hw_launch_cfg<type, 2, 4, 3, 3, false>(HW_ARGS);
+            if constexpr (k23) {
+                mul_mat_vec_q_hw_launch_cfg<type, 2, 2, 4, 2, false>(HW_ARGS);
+            } else {
+                mul_mat_vec_q_hw_launch_cfg<type, 2, 4, 3, 3, false>(HW_ARGS);
+            }
             break;
         case 3:
-            if constexpr (heavy) {
+            if constexpr (k23) {
+                mul_mat_vec_q_hw_launch_cfg<type, 3, 2, 3, 2, false>(HW_ARGS);
+            } else if constexpr (heavy) {
                 mul_mat_vec_q_hw_launch_cfg<type, 3, 4, 3, 3, false>(HW_ARGS);
             } else {
                 mul_mat_vec_q_hw_launch_cfg<type, 3, 2, 4, 2, false>(HW_ARGS);
