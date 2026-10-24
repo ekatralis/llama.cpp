@@ -1580,6 +1580,11 @@ struct ggml_backend_cuda_context {
     const ggml_cgraph * cur_cgraph = nullptr;
     int                 cur_node   = -1;
 
+    // recurrent state gathers (GET_ROWS) not run because the gated delta net reads the rows itself
+    std::vector<ggml_tensor *> deferred_state_rows;
+    const float   * gdn_state_src = nullptr; // set for the next gated delta net launch
+    const int32_t * gdn_state_idx = nullptr;
+
     void mmvq_q8_1_cache_release() {
         if (mmvq_q8_1_cache.ptr != nullptr) {
             pools[mmvq_q8_1_cache.device][0]->free(mmvq_q8_1_cache.ptr, mmvq_q8_1_cache.size);

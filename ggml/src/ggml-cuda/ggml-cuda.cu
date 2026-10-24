@@ -2711,6 +2711,81 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+// Recurrent state gather (GET_ROWS of one cache row) whose only real consumer is the state input of a
+// gated delta net with few tokens: skip it, the delta net reads the cache row through the index.
+static bool ggml_cuda_try_defer_state_rows(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_NO_DEFER_STATE_ROWS");
+    if (disabled) {
+        return false;
+    }
+    ggml_tensor * t = cgraph->nodes[i];
+    if (t->op != GGML_OP_GET_ROWS || t->type != GGML_TYPE_F32 || t->src[0]->type != GGML_TYPE_F32 ||
+            t->src[1]->type != GGML_TYPE_I32 || t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1 ||
+            t->src[0]->ne[0] != t->ne[0] || !ggml_is_contiguous(t->src[0]) || (t->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ctx->curr_stream_no != 0 || !ctx->stream_context().concurrent_events.empty()) {
+        return false;
+    }
+
+    // all uses, following views: views (offset 0), empty copies, or the gated delta net state input
+    int  pending[16];
+    int  n_pending = 0;
+    bool found_gdn = false;
+    pending[n_pending++] = i;
+    while (n_pending > 0) {
+        const int     idx  = pending[--n_pending];
+        const ggml_tensor * node = cgraph->nodes[idx];
+        const int32_t n_uses = ggml_node_get_use_count(cgraph, idx);
+        int found = 0;
+        for (int j = idx + 1; j < cgraph->n_nodes && found < n_uses; ++j) {
+            const ggml_tensor * u = cgraph->nodes[j];
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (u->src[k] != node) {
+                    continue;
+                }
+                found++;
+                if (ggml_is_empty(u)) {
+                    continue;
+                }
+                if (u->op == GGML_OP_VIEW || u->op == GGML_OP_RESHAPE) {
+                    if (u->view_offs != 0 || n_pending == 16 || (u->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                        return false;
+                    }
+                    pending[n_pending++] = j;
+                    continue;
+                }
+                if (u->op == GGML_OP_GATED_DELTA_NET && k == 5 && u->src[2]->ne[2] <= 8 && u->src[2]->ne[3] == 1) {
+                    found_gdn = true;
+                    continue;
+                }
+                return false;
+            }
+        }
+        if (found != n_uses) {
+            return false;
+        }
+    }
+    if (!found_gdn) {
+        return false;
+    }
+    ctx->deferred_state_rows.push_back(t);
+    return true;
+}
+
+// Before a gated delta net: if its state is a deferred gather, pass the cache rows and index to it.
+static void ggml_cuda_prepare_gdn_state(ggml_backend_cuda_context * ctx, const ggml_tensor * gdn) {
+    const ggml_tensor * s = gdn->src[5];
+    while (s->view_src != nullptr && s->op != GGML_OP_GET_ROWS) {
+        s = s->view_src;
+    }
+    for (ggml_tensor * t : ctx->deferred_state_rows) {
+        if (t == s) {
+            ctx->gdn_state_src = (const float *) t->src[0]->data;
+            ctx->gdn_state_idx = (const int32_t *) t->src[1]->data;
+            return;
+        }
+    }
+}
+
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
@@ -4772,6 +4847,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 cuda_ctx->cur_cgraph = cgraph;
                 cuda_ctx->cur_node   = i;
 
+                if (ggml_cuda_try_defer_state_rows(cuda_ctx, cgraph, i)) {
+                    continue;
+                }
+                if (node->op == GGML_OP_GATED_DELTA_NET) {
+                    ggml_cuda_prepare_gdn_state(cuda_ctx, node);
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4930,6 +5012,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->mmvq_q8_1_cache_release();
     cuda_ctx->cur_cgraph = nullptr;
     cuda_ctx->cur_node   = -1;
+    cuda_ctx->deferred_state_rows.clear();
+    cuda_ctx->gdn_state_src = nullptr;
+    cuda_ctx->gdn_state_idx = nullptr;
 
     return GGML_STATUS_SUCCESS;
 }
