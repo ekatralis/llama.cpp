@@ -350,6 +350,25 @@ Tried and dropped:
 Remaining: the multi-column path used by the MTP verify (ysh kernel, 3 columns), the 5120-row
 IQ4_XS / K-quant calls (bias fused), the 48-row Q8_0 alpha / beta pair (two 9.5 us launches).
 
+### Output reference points (vs stock upstream f5027fb)
+
+Measured with `kld-check.sh` (KL divergence of the logits vs stock; ubatch 512 = prompt kernels,
+1 = single-token generation kernels, 4 = multi-token kernels as in the MTP verify).
+
+| commits | prompt (ubatch 512) | generation (ubatch 1) |
+|---|---|---|
+| f5027fb (upstream base) | identical | identical |
+| a25d385 .. 642a6b6 | same as stock (KLD 0, max = stock run-to-run noise) | differs: KLD 0.000341, same top 97.6% |
+| cf35d3b .. | same as stock (rechecked at 97d07dd) | differs: KLD 0.000384, same top 97.8% |
+
+- Generation output has not been bit-identical to stock since the first fork commit a25d385
+  (batch-1 MMVQ launch shape 2 -> 1 warps changes the float summation order). The size is the same
+  as stock's own difference between ubatch sizes (stock ubatch 4 vs 1: KLD 0.000312).
+- a25d385 .. 642a6b6 (tag `gfx906-qwen38-pre-hw`): every commit after a25d385 kept the logits
+  identical to the previous fork build (same kld-check numbers, identical MTP outputs).
+- cf35d3b (half-wave single-column MMVQ) changes the generation results again (summation order).
+  `GGML_CUDA_NO_MMVQ_HW=1` restores the 642a6b6 results. ubatch 4 results did not change.
+
 ## Log
 
 ### 2026-10-23
