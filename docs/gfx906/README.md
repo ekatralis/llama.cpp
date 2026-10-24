@@ -3,7 +3,9 @@
 Goal: get the most performance out of an AMD Radeon VII (gfx906) running
 `Qwen3.8-27B-UD-Q3_K_XL.gguf`, then judge which changes could go upstream.
 
-- Fork branch: `gfx906` (from upstream `master` @ `f5027fb`, 2026-10-23)
+- Fork branch: `gfx906` (from upstream `master` @ `f5027fb`, 2026-10-23): general gfx906 work
+- Branch `gfx906-qwen38` (from `gfx906` @ `99d3030`, 2026-10-24): work aimed only at this model and
+  config (MTP speculative decoding, small-batch kernels); see "MTP plan" below
 - Git identity (repo-local only): Evangelos Katralis <vkatralis@gmail.com>
 
 ## Hardware / software
@@ -124,6 +126,50 @@ Local checkout is shallow (1 commit) and `gh` is not installed, so this was read
     reductions, q8 activation cache, fused norm), mixa3607 `amd-memory-tweak` (HBM2 timing
     tuning, needs root, stability risk).
   - Claims ROCm 6.1 is "the measured optimum for gfx906", with no numbers given.
+
+## MTP plan (branch `gfx906-qwen38`, 2026-10-24)
+
+The model has one MTP (nextn) layer; `llama-server --spec-type draft-mtp --spec-draft-n-max 3`
+already gives 34-39 t/s vs 28 t/s without (greedy, two prompts, 69-83% draft acceptance).
+Each step is one verify pass over k+1 tokens plus k draft passes.
+
+Forward pass time vs batch size (`llama-bench -p N -n 0 -r 40`, median):
+
+| tokens | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|
+| ms | 33.1 | 48.3 | 69.3 | 67.5 | 67.4 |
+
+Weights are read once per pass, so this should be nearly flat. Matmul cost per call
+(`/opt/gfx906-tools/mmvq-ncols-bench.sh`, us):
+
+| type / shape | n=1 | n=2 | n=3 | n=4 | n=4 / n=1 |
+|---|---:|---:|---:|---:|---:|
+| IQ4_XS 5120x17408 | 76 | 134 | 186 | 195 | 2.6x |
+| IQ3_S 5120x17408 | 94 | 132 | 258 | 226 | 2.4x |
+| IQ3_XXS 5120x17408 | 94 | 138 | 206 | 204 | 2.2x |
+| Q4_K 5120x17408 | 82 | 120 | 155 | 215 | 2.6x |
+| Q5_K output 5120x248320 | 1298 | 1834 | 2266 | 3073 | 2.4x |
+
+The weight decode is not repeated per column: the compiler shares it (v_perm / grid reads
+constant from n=1 to n=4; loop 189 -> 281 instructions for IQ4_XS). What grows are the
+activation (y) loads, 3 vector loads per column per iteration. A workgroup covers only 2 rows
+but reads the whole y, so a 17408-row matmul with 4 columns pulls ~200 MB of y through the cache
+for 47 MB of weights. n=3 is often slower than n=4 (launch config).
+
+Estimate (draft 3; 2.75-3.2 tokens per step measured; ~13.5 ms of draft passes per step):
+
+| scenario | step | t/s |
+|---|---:|---:|
+| MTP today (verify 67.5 ms) | ~81 ms | 34-39 |
+| verify pass at ~1.25x a 1-token pass (~41 ms) | ~55 ms | ~50-58 |
+| + cheaper draft passes (output head is 1.3 ms per draft) | ~48 ms | ~57-65 |
+| no MTP, single-token matmuls 26.7 -> 20 ms (repacking, uncertain) | ~26 ms/token | ~38 |
+
+So the small-batch (2-5 column) kernels come first. Single-token work still helps the draft
+passes. Caveat: acceptance is from two greedy prompts; sampling or harder text lowers it.
+
+Plan: (1) small-batch MMVQ: more rows per workgroup / y reuse, fix n=3; (2) tiled concat for
+small token counts; (3) cheaper draft pass.
 
 ## Log
 
