@@ -481,6 +481,36 @@ gated ops 0.37, rope 0.32 (slow kernel, see above), conv state concat 0.27, gate
 attention q / k norm 0.16, K / V set_rows 0.13. In the 3-token pass also SWIGLU (gate / up
 are fused only for 1 column) and the remaining adds.
 
+### Open options for prompt processing (2026-10-25, not started)
+
+Status: pp512 385 t/s, pp512 @ d8192 343 t/s (upstream f5027fb: 241 / 223). 385 t/s x 2 x 27.3 B
+weights = ~21 TOPS, ~40% of the dp4a peak (60 CU x 64 lanes x 8 ops x 1.75 GHz = ~54 TOPS). This
+counts the whole pass, so the MMQ kernels alone are a little above 40%. Gain estimates below are
+guesses, not measurements. Recheck the pp512 profile (rocprofv3 kernel trace) before starting any
+of them; the last full profile (2.09 s per pass) is from before changes 6-12.
+
+1. gfx906 MMQ kernel with a new x (weight) tile layout. Expected +10-20% pp, weeks of work.
+   - Why: after changes 6 / 7 / 10 (y read from VRAM through SGPRs), the dot loop is limited by
+     x reads from LDS. The x tile row stride (2*MMQ_TILE_NE_K + 1 ints, padded against bank
+     conflicts) only allows 32-bit `ds_read`. Another gfx906 fork reported a "~41% issue
+     ceiling" after five inner-loop restructures, which matches what we see.
+   - Ideas: an unpadded, swizzled x layout that allows `ds_read_b64` / `ds_read_b128`; or keep a
+     slice of x in VGPRs per thread and stream columns of y (y is already in SGPRs).
+   - Risk: mmq.cuh / mmq-load-tiles.cuh are shared by all CUDA / HIP targets, so this is the part
+     hardest to upstream. Bit-exact with stock is not guaranteed (summation order).
+2. Attention at long context. Expected a few % at 8k, more at 32k+.
+   - pp512 drops 11% from depth 0 to 8192. Only 16 of the 64 layers are full attention, the rest
+     are gated delta net (whose cost does not grow with depth).
+   - First measure pp512 @ d32768 and the flash attention share at depth; then look at the
+     FA tile kernel config for GCN (no matrix cores on gfx906).
+3. Larger ubatch (`-ub 1024` / `2048`, with `-b` at least as big). A settings check only, no code.
+   Might give 5-10% on long prompts (fewer weight passes, more MMQ tiles per CU). Measure with
+   `llama-bench -p 2048 -ub 512,1024,2048` and check VRAM use at the target context.
+
+Already tried for prompt (see the 2026-10-23 log): chunked (WY) gated delta net prefill (0.5x of
+the recurrent kernel without matrix units), double-buffered y, preloading y for all columns
+(spills), IQ3_S sign helper in the loader (noise), 256-thread / occupancy-1 MMQ configs.
+
 ### Output reference points (vs stock upstream f5027fb)
 
 Measured with `kld-check.sh` (KL divergence of the logits vs stock; ubatch 512 = prompt kernels,
