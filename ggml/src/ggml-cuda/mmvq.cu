@@ -74,6 +74,7 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
     MMVQ_PARAMETERS_TURING,
     MMVQ_PARAMETERS_GCN,
+    MMVQ_PARAMETERS_VEGA20,
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
@@ -87,6 +88,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA3_0;
 #elif defined(RDNA2) || defined(RDNA3_5)
     return MMVQ_PARAMETERS_RDNA2;
+#elif defined(__gfx906__)
+    return MMVQ_PARAMETERS_VEGA20;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
@@ -107,6 +110,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) {
         return MMVQ_PARAMETERS_RDNA2;
+    }
+    if (cc == GGML_CUDA_CC_VEGA20) {
+        return MMVQ_PARAMETERS_VEGA20;
     }
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
         return MMVQ_PARAMETERS_GCN;
@@ -438,9 +444,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
             default:
                 return 1;
         }
-    } else if (table_id == MMVQ_PARAMETERS_GCN) {
+    } else if (table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_VEGA20) {
         switch (ncols_dst) {
             case 1:
+                return table_id == MMVQ_PARAMETERS_VEGA20 ? 1 : 2;
             case 2:
             case 3:
             case 4:
@@ -558,10 +565,14 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
         (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_TURING)) {
         return ptq1_0_pt_rows_per_block(ncols_dst);
     }
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_VEGA20 ||
+            table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
-                return small_k ? nwarps : 1;
+                if (small_k) {
+                    return nwarps;
+                }
+                return table_id == MMVQ_PARAMETERS_VEGA20 ? 2 : 1;
             case 2:
             case 3:
             case 4:
