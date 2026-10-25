@@ -234,7 +234,11 @@ static __global__ void fwht_quantize_q8_1(
 
         float amax = fabsf(xi);
         float sum  = xi;
+#if defined(__gfx906__)
+        amax = ggml_cuda_gfx906_reduce_max32(amax);
+#else
         amax = warp_reduce_max<QK8_1>(amax);
+#endif // defined(__gfx906__)
         sum  = warp_reduce_sum<QK8_1>(sum);
 
         const float  d = amax / 127.0f;
@@ -250,7 +254,11 @@ static __global__ void fwht_quantize_q8_1(
             ycol[((e / 16)*nblk + kb) * 16 + (e % 16)] = q;
 
             int isum = q;
+            #if defined(__gfx906__)
+            isum = ggml_cuda_gfx906_reduce_sum32(isum);
+#else
             isum = warp_reduce_sum<QK8_1>(isum);
+#endif // defined(__gfx906__)
             if (iqs == 0) {
                 half2 * ds = (half2 *) (ycol + 8*nblk*16) + kb*4 + e / QK8_1;
                 *ds = make_half2(__float2half(d), __short_as_half((short) isum));
@@ -262,7 +270,11 @@ static __global__ void fwht_quantize_q8_1(
             ((int8_t *) ycol)[kb*QK8_1 + (e / 16)*16 + (e % 4)*4 + (e % 16)/4] = q;
 
             int isum = q;
+            #if defined(__gfx906__)
+            isum = ggml_cuda_gfx906_reduce_sum32(isum);
+#else
             isum = warp_reduce_sum<QK8_1>(isum);
+#endif // defined(__gfx906__)
             if (iqs == 0) {
                 half2 * ds = (half2 *) (ycol + ne0) + kb;
                 *ds = make_half2(__float2half(d), __short_as_half((short) isum));
