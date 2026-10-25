@@ -1204,7 +1204,7 @@ static void mul_mat_vec_q_switch_fusion(
 #define MMVQ_HW_LAUNCH_BOUNDS(nthreads, wpe) __launch_bounds__(nthreads, 1)
 #endif
 
-// gfx906 PTQ1_0 / PQ2_0 mat-vec on their dedicated activation layouts (PT, PQ2): one column for PTQ1_0, 1-4 for PQ2_0.
+// gfx906 PTQ1_0 / PQ2_0 mat-vec on their dedicated activation layouts (PT, PQ2): one column for PTQ1_0, 1-5 for PQ2_0.
 // A group of lpr lanes shares rows_per_group rows; each lane takes whole x blocks (PTQ1_0: 128 weights,
 // PQ2_0: one 32-weight chunk) along K, and every activation piece it loads serves all rows of the group.
 // With several columns the x decode is shared by the columns.
@@ -1387,6 +1387,7 @@ static void mul_mat_vec_q_lg_launch(const void * vx, const void * vy, const ggml
             case 2: mul_mat_vec_q_lg_launch_cfg<type, 2, 1, 32, 4, 3, false>(LG_ARGS); break;
             case 3: mul_mat_vec_q_lg_launch_cfg<type, 3, 1, 32, 3, 3, false>(LG_ARGS); break;
             case 4: mul_mat_vec_q_lg_launch_cfg<type, 4, 1, 32, 4, 2, false>(LG_ARGS); break;
+            case 5: mul_mat_vec_q_lg_launch_cfg<type, 5, 1, 32, 4, 2, false>(LG_ARGS); break;
             default: GGML_ABORT("fatal error");
         }
     }
