@@ -4320,6 +4320,47 @@ struct test_unary_mul : public test_case {
     }
 };
 
+// rms_norm * weight feeding a quantized mat-vec (some backends write the mat-vec's quantized input in the norm)
+struct test_rms_norm_mul_mat : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_out;
+    const int64_t n_tokens;
+
+    ggml_tensor * norm = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT";
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { norm }; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_embd, n_out, n_tokens);
+    }
+
+    test_rms_norm_mul_mat(ggml_type type = GGML_TYPE_Q4_0, int64_t n_embd = 5120, int64_t n_out = 256, int64_t n_tokens = 1)
+        : type(type), n_embd(n_embd), n_out(n_out), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * g  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_tensor * w  = ggml_new_tensor_2d(ctx, type, n_embd, n_out);
+        ggml_set_name(x, "x");
+        ggml_set_name(g, "g");
+        ggml_set_name(w, "w");
+
+        norm = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), g);
+        ggml_set_name(norm, "norm");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, w, norm);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Delta-net conv of one token: ssm_conv + silu, then the L2 norm (rms_norm + scale) of the q and k heads,
 // in the Qwen3.5 graph order (some backends run it in one launch).
 struct test_gdn_conv_l2 : public test_case {
@@ -10119,6 +10160,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
 
+    for (int64_t n_tokens : { 1, 2, 3, 4, 5 }) {
+        test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q4_0, 5120, 256, n_tokens));
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_IQ4_XS, 2048, 512, 1));
     test_cases.emplace_back(new test_gdn_conv_l2(4, 16, 10240));
     test_cases.emplace_back(new test_gdn_conv_l2(4, 2, 1024));
     test_cases.emplace_back(new test_gdn_conv_l2(3, 4, 1536));

@@ -1,4 +1,6 @@
 #include "norm.cuh"
+#include "mmvq.cuh"
+#include "quantize-lane.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -637,6 +639,42 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
+
+// rms_norm * mul of rows of 1024*k values that also writes the q8_1 copy for the next MMVQ. gridDim.x slices of 1024
+// columns per row: every block sums the whole row in the order of rms_norm_f32<1024, 4, true, true> (same scale), then
+// normalizes and quantizes one value per thread. With one block per row the quantize serializes (see 6cdfbae).
+static __global__ void __launch_bounds__(1024, 1) rms_norm_mul_q8_1_f32(
+        const float * __restrict__ x, const float * __restrict__ mul, float * __restrict__ dst,
+        block_q8_1 * __restrict__ q8, const int ncols, const int64_t stride_row, const float eps) {
+    constexpr int block_size = 1024;
+    constexpr int vpt        = 4;
+    __shared__ float s_sum[32];
+
+    const int row = blockIdx.y;
+    const int tid = threadIdx.x;
+    const float  * xr = x + row*stride_row;
+    const float4 * x4 = (const float4 *) xr;
+    const int ncols4 = ncols/4;
+
+    float tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            const float4 v = x4[i];
+            tmp += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+    const int col = blockIdx.x*block_size + tid;
+    float r = scale*xr[col];
+    r *= mul[col];
+    dst[(int64_t) row*ncols + col] = r;
+    quantize_q8_1_lane(r, q8 + (int64_t) row*(ncols/QK8_1), col);
+}
+
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
@@ -682,6 +720,21 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nrows     = mul_src->ne[1];
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
+
+    // few rows feeding a MMVQ: also write its q8_1 copy (sliced kernel, same values)
+    static const bool q8_disabled = getenv("GGML_CUDA_NO_NORM_Q8") != nullptr;
+    const int64_t nrows_all = ne01*ne02*ne03;
+    if (!q8_disabled && ne00 % 1024 == 0 && ne00 <= 4*4*1024 && nrows_all <= MMVQ_MAX_BATCH_SIZE &&
+            ggml_is_contiguous(rms_norm_src) && ggml_is_contiguous(mul_tensor) && ggml_is_contiguous(mul_src) &&
+            mul_ncols == ne00 && ggml_nelements(mul_src) == ne00) {
+        block_q8_1 * q8 = ggml_cuda_mmvq_q8_1_produce(ctx, mul_tensor);
+        if (q8 != nullptr) {
+            const dim3 blocks(ne00/1024, nrows_all, 1);
+            rms_norm_mul_q8_1_f32<<<blocks, 1024, 0, stream>>>(
+                (const float *) rms_norm_src->data, (const float *) mul_src->data, dst_d, q8, ne00, s01, eps);
+            return;
+        }
+    }
 
     rms_norm_mul_f32_cuda(rms_norm_src, mul_src, nullptr, dst_d,
                           ne00, ne01, ne02, ne03,
