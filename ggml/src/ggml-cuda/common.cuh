@@ -1303,13 +1303,13 @@ static inline bool ggml_cuda_pq2_multicol(int ncols_dst) {
 #endif
 }
 
-// gfx906 one-column PTQ1_0 / PQ2_0 mat-vec (mul_mat_vec_q_lg in mmvq.cu) reads the PT / PQ2 layouts
+// gfx906 PTQ1_0 (1 column) / PQ2_0 (1-4 columns) mat-vec (mul_mat_vec_q_lg in mmvq.cu) reads the PT / PQ2 layouts
 static inline bool ggml_cuda_gfx906_lg_layout(ggml_type type_src0, int ncols_dst, bool has_ids, bool plain_2d) {
 #if defined(GGML_USE_HIP)
     static const bool disabled = getenv("GGML_CUDA_NO_MMVQ_HW") != nullptr;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    return !disabled && cc == GGML_CUDA_CC_VEGA20 && ncols_dst == 1 && !has_ids && plain_2d &&
-        (type_src0 == GGML_TYPE_PTQ1_0 || type_src0 == GGML_TYPE_PQ2_0);
+    return !disabled && cc == GGML_CUDA_CC_VEGA20 && !has_ids && plain_2d &&
+        ((type_src0 == GGML_TYPE_PTQ1_0 && ncols_dst == 1) || (type_src0 == GGML_TYPE_PQ2_0 && ncols_dst <= 4));
 #else
     GGML_UNUSED_VARS(type_src0, ncols_dst, has_ids, plain_2d);
     return false;

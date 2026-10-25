@@ -1204,16 +1204,19 @@ static void mul_mat_vec_q_switch_fusion(
 #define MMVQ_HW_LAUNCH_BOUNDS(nthreads, wpe) __launch_bounds__(nthreads, 1)
 #endif
 
-// gfx906 single-column PTQ1_0 / PQ2_0 mat-vec on their dedicated activation layouts (PT, PQ2).
+// gfx906 PTQ1_0 / PQ2_0 mat-vec on their dedicated activation layouts (PT, PQ2): one column for PTQ1_0, 1-4 for PQ2_0.
 // A group of lpr lanes shares rows_per_group rows; each lane takes whole x blocks (PTQ1_0: 128 weights,
 // PQ2_0: one 32-weight chunk) along K, and every activation piece it loads serves all rows of the group.
-template <ggml_type type, int nwaves, int lpr, int rows_per_group, int waves_per_eu, bool has_gate>
+// With several columns the x decode is shared by the columns.
+template <ggml_type type, int ncols, int nwaves, int lpr, int rows_per_group, int waves_per_eu, bool has_gate>
 MMVQ_HW_LAUNCH_BOUNDS(nwaves*64, waves_per_eu)
 static __global__ void mul_mat_vec_q_lg(
         const void * __restrict__ vx, const void * __restrict__ vy, const ggml_cuda_mm_fusion_args_device fusion,
-        float * __restrict__ dst, const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x) {
+        float * __restrict__ dst, const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t stride_col_dst) {
 #if defined(__gfx906__)
     static_assert(type == GGML_TYPE_PTQ1_0 || type == GGML_TYPE_PQ2_0, "PT / PQ2 layouts only");
+    static_assert(ncols == 1 || (type == GGML_TYPE_PQ2_0 && !has_gate), "several columns: PQ2_0 without gate only");
     constexpr int R = rows_per_group;
     const int lane = threadIdx.x;
     const int gl   = lane % lpr;
@@ -1225,8 +1228,8 @@ static __global__ void mul_mat_vec_q_lg(
         rows[i] = min(uint32_t(row0 + i), nrows_x - 1); // clamped rows are computed but not stored
     }
 
-    float acc[R]      = {0.0f};
-    float acc_gate[R] = {0.0f};
+    float acc[ncols][R] = {{0.0f}};
+    float acc_gate[R]   = {0.0f};
 
     if constexpr (type == GGML_TYPE_PTQ1_0) {
         const int nblk_x = ncols_x / QK_PTQ1_0;
@@ -1242,7 +1245,7 @@ static __global__ void mul_mat_vec_q_lg(
             ptq1_0_pt_block_dot<1, R>(bq, ycol, kbx, nblk, dots);
 #pragma unroll
             for (int i = 0; i < R; ++i) {
-                acc[i] += dots[0][i];
+                acc[0][i] += dots[0][i];
             }
             if constexpr (has_gate) {
 #pragma unroll
@@ -1257,47 +1260,62 @@ static __global__ void mul_mat_vec_q_lg(
             }
         }
     } else {
-        // PQ2 layout: per 32-element chunk c, qs bytes at c*32 (permuted inside 16-element groups),
+        // PQ2 layout, per column: qs bytes of 32-element chunk c at c*32 (permuted inside 16-element groups),
         // then one half2 (d, exact int sum) per chunk after the qs region
-        const int    nchunk = ncols_x / QK8_1;
-        const char * y      = (const char *) vy;
-        const int    ds_off = GGML_PAD(ncols_x, MATRIX_ROW_PADDING); // qs region length of a column
-        auto dot_chunk = [&](const void * vw, const int c, const int4 a0, const int4 a1, const float d8, const int qsum, float (&out)[R]) {
+        const int    nchunk    = ncols_x / QK8_1;
+        const char * y         = (const char *) vy;
+        const int    ds_off    = GGML_PAD(ncols_x, MATRIX_ROW_PADDING); // qs region length of a column
+        const size_t col_bytes = (size_t) stride_col_y * sizeof(block_q8_1);
+        auto load_x = [&](const void * vw, const int c, uint32_t (&w0)[R], uint32_t (&w1)[R], float (&d2)[R]) {
 #pragma unroll
             for (int i = 0; i < R; ++i) {
                 const block_pq2_0 * blk = (const block_pq2_0 *) vw + (int64_t) rows[i]*stride_row_x + (c >> 2);
                 const uint16_t    * qp  = (const uint16_t *) (blk->qs + (c & 3)*8); // blocks are only 2-byte aligned
-                const float d2 = __half2float(blk->d);
-                const uint32_t w0 = (uint32_t) qp[0] | ((uint32_t) qp[1] << 16);
-                const uint32_t w1 = (uint32_t) qp[2] | ((uint32_t) qp[3] << 16);
+                d2[i] = __half2float(blk->d);
+                w0[i] = (uint32_t) qp[0] | ((uint32_t) qp[1] << 16);
+                w1[i] = (uint32_t) qp[2] | ((uint32_t) qp[3] << 16);
+            }
+        };
+        auto dot_rows = [&](const uint32_t (&w0)[R], const uint32_t (&w1)[R], const float (&d2)[R],
+                            const int4 a0, const int4 a1, const float d8, const int qsum, float (&out)[R]) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
                 int sumi = 0;
-                sumi = ggml_cuda_dp4a((int) ((w0 >> 0) & 0x03030303u), a0.x, sumi);
-                sumi = ggml_cuda_dp4a((int) ((w0 >> 2) & 0x03030303u), a0.y, sumi);
-                sumi = ggml_cuda_dp4a((int) ((w0 >> 4) & 0x03030303u), a0.z, sumi);
-                sumi = ggml_cuda_dp4a((int) ((w0 >> 6) & 0x03030303u), a0.w, sumi);
-                sumi = ggml_cuda_dp4a((int) ((w1 >> 0) & 0x03030303u), a1.x, sumi);
-                sumi = ggml_cuda_dp4a((int) ((w1 >> 2) & 0x03030303u), a1.y, sumi);
-                sumi = ggml_cuda_dp4a((int) ((w1 >> 4) & 0x03030303u), a1.z, sumi);
-                sumi = ggml_cuda_dp4a((int) ((w1 >> 6) & 0x03030303u), a1.w, sumi);
-                out[i] += d2 * d8 * (float) (sumi - qsum);
+                sumi = ggml_cuda_dp4a((int) ((w0[i] >> 0) & 0x03030303u), a0.x, sumi);
+                sumi = ggml_cuda_dp4a((int) ((w0[i] >> 2) & 0x03030303u), a0.y, sumi);
+                sumi = ggml_cuda_dp4a((int) ((w0[i] >> 4) & 0x03030303u), a0.z, sumi);
+                sumi = ggml_cuda_dp4a((int) ((w0[i] >> 6) & 0x03030303u), a0.w, sumi);
+                sumi = ggml_cuda_dp4a((int) ((w1[i] >> 0) & 0x03030303u), a1.x, sumi);
+                sumi = ggml_cuda_dp4a((int) ((w1[i] >> 2) & 0x03030303u), a1.y, sumi);
+                sumi = ggml_cuda_dp4a((int) ((w1[i] >> 4) & 0x03030303u), a1.z, sumi);
+                sumi = ggml_cuda_dp4a((int) ((w1[i] >> 6) & 0x03030303u), a1.w, sumi);
+                out[i] += d2[i] * d8 * (float) (sumi - qsum);
             }
         };
         for (int c = gl; c < nchunk; c += lpr) {
-            const int4  a0 = *(const int4 *) (y + c*QK8_1);
-            const int4  a1 = *(const int4 *) (y + c*QK8_1 + 16);
-            const half2 ds = *(const half2 *) (y + ds_off + c*sizeof(half2));
-            const float d8   = __low2float(ds);
-            const int   qsum = __half_as_short(__high2half(ds));
-            dot_chunk(vx, c, a0, a1, d8, qsum, acc);
-            if constexpr (has_gate) {
-                dot_chunk(fusion.gate, c, a0, a1, d8, qsum, acc_gate);
+            uint32_t w0[R], w1[R];
+            float    d2[R];
+            load_x(vx, c, w0, w1, d2);
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                const char * yc = y + j*col_bytes;
+                const int4  a0 = *(const int4 *) (yc + c*QK8_1);
+                const int4  a1 = *(const int4 *) (yc + c*QK8_1 + 16);
+                const half2 ds = *(const half2 *) (yc + ds_off + c*sizeof(half2));
+                dot_rows(w0, w1, d2, a0, a1, __low2float(ds), __half_as_short(__high2half(ds)), acc[j]);
+                if constexpr (has_gate) {
+                    load_x(fusion.gate, c, w0, w1, d2);
+                    dot_rows(w0, w1, d2, a0, a1, __low2float(ds), __half_as_short(__high2half(ds)), acc_gate);
+                }
             }
         }
     }
 
 #pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+#pragma unroll
     for (int i = 0; i < R; ++i) {
-        float result = warp_reduce_sum<lpr>(acc[i]);
+        float result = warp_reduce_sum<lpr>(acc[j][i]);
         [[maybe_unused]] float gate_value = 0.0f;
         if constexpr (has_gate) {
             gate_value = warp_reduce_sum<lpr>(acc_gate[i]);
@@ -1307,7 +1325,7 @@ static __global__ void mul_mat_vec_q_lg(
             continue;
         }
         if (fusion.x_bias != nullptr) {
-            result += ((const float *) fusion.x_bias)[row];
+            result += ((const float *) fusion.x_bias)[j*stride_col_dst + row];
         }
         if constexpr (has_gate) {
             if (fusion.gate_bias != nullptr) {
@@ -1328,22 +1346,24 @@ static __global__ void mul_mat_vec_q_lg(
                     break;
             }
         }
-        dst[row] = result;
+        dst[j*stride_col_dst + row] = result;
+    }
     }
 #else
-    GGML_UNUSED_VARS(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x);
+    GGML_UNUSED_VARS(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst);
     NO_DEVICE_CODE;
 #endif // defined(__gfx906__)
 }
 
-template <ggml_type type, int nwaves, int lpr, int R, int wpe, bool has_gate>
+template <ggml_type type, int ncols, int nwaves, int lpr, int R, int wpe, bool has_gate>
 static void mul_mat_vec_q_lg_launch_cfg(const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion,
-        float * dst, const int ncols_x, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
+        float * dst, const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y,
+        const int stride_col_dst, cudaStream_t stream) {
     constexpr int rows_per_block = nwaves*(64/lpr)*R;
     const dim3 block_dims(64, nwaves, 1);
     const dim3 block_nums((nrows_x + rows_per_block - 1)/rows_per_block, 1, 1);
-    mul_mat_vec_q_lg<type, nwaves, lpr, R, wpe, has_gate><<<block_nums, block_dims, 0, stream>>>(
-        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x);
+    mul_mat_vec_q_lg<type, ncols, nwaves, lpr, R, wpe, has_gate><<<block_nums, block_dims, 0, stream>>>(
+        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst);
 }
 
 // Launch shapes measured in generation (Bonsai 2 27B): PTQ1_0 keeps a whole 128-weight block per lane with
@@ -1351,12 +1371,25 @@ static void mul_mat_vec_q_lg_launch_cfg(const void * vx, const void * vy, const 
 // and the memory unit becomes the limit. PQ2_0 decodes cheaply and prefers 2 rows per 32-lane group.
 template <ggml_type type, bool has_gate>
 static void mul_mat_vec_q_lg_launch(const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion,
-        float * dst, const int ncols_x, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
+        float * dst, const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+#define LG_ARGS vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream
     if constexpr (type == GGML_TYPE_PTQ1_0) {
-        mul_mat_vec_q_lg_launch_cfg<type, 1, 8, 1, 2, has_gate>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stream);
+        GGML_ASSERT(ncols_dst == 1);
+        mul_mat_vec_q_lg_launch_cfg<type, 1, 1, 8, 1, 2, has_gate>(LG_ARGS);
+    } else if constexpr (has_gate) {
+        GGML_ASSERT(ncols_dst == 1);
+        mul_mat_vec_q_lg_launch_cfg<type, 1, 1, 32, 2, 4, true>(LG_ARGS);
     } else {
-        mul_mat_vec_q_lg_launch_cfg<type, 1, 32, 2, 4, has_gate>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stream);
+        switch (ncols_dst) {
+            case 1: mul_mat_vec_q_lg_launch_cfg<type, 1, 1, 32, 2, 4, false>(LG_ARGS); break;
+            case 2: mul_mat_vec_q_lg_launch_cfg<type, 2, 1, 32, 2, 4, false>(LG_ARGS); break;
+            case 3: mul_mat_vec_q_lg_launch_cfg<type, 3, 1, 32, 2, 4, false>(LG_ARGS); break;
+            case 4: mul_mat_vec_q_lg_launch_cfg<type, 4, 1, 32, 2, 4, false>(LG_ARGS); break;
+            default: GGML_ABORT("fatal error");
+        }
     }
+#undef LG_ARGS
 }
 
 template <ggml_type type>
@@ -1517,12 +1550,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
 #if defined(GGML_USE_HIP)
     if constexpr (type == GGML_TYPE_PTQ1_0 || type == GGML_TYPE_PQ2_0) {
         if (y_layout == GGML_CUDA_Q8_1_PT || y_layout == GGML_CUDA_Q8_1_PQ2) {
-            // ggml_cuda_q8_1_layout_host picks these layouts on HIP only for the gfx906 one-column kernel
-            GGML_ASSERT(!ids && ncols_dst == 1 && nchannels_dst == 1 && nsamples_dst == 1);
+            // ggml_cuda_q8_1_layout_host picks these layouts on HIP only for the gfx906 lane-group kernel
+            GGML_ASSERT(!ids && nchannels_dst == 1 && nsamples_dst == 1);
             if (fusion.gate != nullptr) {
-                mul_mat_vec_q_lg_launch<type, true>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stream);
+                mul_mat_vec_q_lg_launch<type, true>(vx, vy, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x,
+                    stride_col_y, stride_col_dst, stream);
             } else {
-                mul_mat_vec_q_lg_launch<type, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stream);
+                mul_mat_vec_q_lg_launch<type, false>(vx, vy, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x,
+                    stride_col_y, stride_col_dst, stream);
             }
             return;
         }
