@@ -261,7 +261,26 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-#if !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_HIP) || defined(__gfx906__)
+// CUDA __byte_perm semantics; on HIP one v_perm_b32 (operands swapped, selector nibbles widened to bytes)
+static __device__ __forceinline__ uint32_t ptq1_0_mmq_byte_perm(const uint32_t x, const uint32_t y, const uint32_t s) {
+#if defined(GGML_USE_HIP)
+    const uint32_t sa = (s & 0xF) | (((s >> 4) & 0xF) << 8) | (((s >> 8) & 0xF) << 16) | (((s >> 12) & 0xF) << 24);
+    return __builtin_amdgcn_perm(y, x, sa);
+#else
+    return __byte_perm(x, y, s);
+#endif
+}
+
+// digits 0..2 per byte -> -1..1; on HIP without the emulated __vsub4 (no carry: each byte + 0x7F <= 0x81)
+static __device__ __forceinline__ int ptq1_0_mmq_unbias(const uint32_t q) {
+#if defined(GGML_USE_HIP)
+    return (int) ((q + 0x7F7F7F7Fu) ^ 0x80808080u);
+#else
+    return __vsub4(q, 0x01010101);
+#endif
+}
+
 template <ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const char * __restrict__ x,
                                                                        int * __restrict__ x_tile,
@@ -307,8 +326,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
 
         // Branch-free unpack: all 8 lanes run the same 5-iteration trit loop on their own 32-bit word. Only smem store offsets differ, so the warp does not diverge.
         const uint32_t packed = get_int_b4(bxi->qs, lane < 7 ? lane : 6);
-        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);   // bytes 0,1 as 16-bit lanes
-        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);   // bytes 2,3
+        uint32_t       v_lo   = ptq1_0_mmq_byte_perm(packed, 0, 0x4140);   // bytes 0,1 as 16-bit lanes
+        uint32_t       v_hi   = ptq1_0_mmq_byte_perm(packed, 0, 0x4342);   // bytes 2,3
         const bool     full_lane = lane < 6;
         v_hi = full_lane ? v_hi : v_lo;                           // lane 6: both halves walk qh0/qh1
         const int  dst_base   = lane < 4 ? lane : 16 + lane;      // lanes 4,5 -> 20,21
@@ -320,15 +339,15 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
             const uint32_t w_hi = v_hi * 3;
             v_lo = w_lo & 0x00FF00FF;
             v_hi = w_hi & 0x00FF00FF;
-            q[t] = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            q[t] = ptq1_0_mmq_unbias(ptq1_0_mmq_byte_perm(w_lo, w_hi, 0x7531));
             if (full_lane) {
                 row[dst_base + t * dst_stride] = q[t];
             }
         }
         if (lane == 6) {
             // q[t] = {qh0.t, qh1.t, qh0.t, qh1.t}; the old layout is {qh0.t, qh1.t, qh0.t+1, qh1.t+1}.
-            row[30] = __byte_perm(q[0], q[1], 0x5410);
-            row[31] = __byte_perm(q[2], q[3], 0x5410);
+            row[30] = ptq1_0_mmq_byte_perm(q[0], q[1], 0x5410);
+            row[31] = ptq1_0_mmq_byte_perm(q[2], q[3], 0x5410);
         }
     }
 
