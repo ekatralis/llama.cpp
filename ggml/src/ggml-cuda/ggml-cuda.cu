@@ -4730,6 +4730,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fused_node_count  = 2;
             break;
         }
+
     }
 
     if (fused_mul_mat_vec) {
@@ -4761,7 +4762,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
-    // delta net, one token: ssm_conv + silu, then the q / k L2 norms (rms_norm + scale over 128-wide heads) in one launch
+    // delta net, 1-8 tokens: ssm_conv + silu, then the q / k L2 norms (rms_norm + scale over 128-wide heads) in one launch
     if (node->op == GGML_OP_SSM_CONV && i + 8 <= cgraph->n_nodes) {
         static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_NO_CONV_L2_FUSION");
         const ggml_op ops[] = { GGML_OP_SSM_CONV, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_RMS_NORM, GGML_OP_SCALE,
@@ -4784,12 +4785,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * qv = n[2];
             const ggml_tensor * kv = n[5];
             const int64_t n_l2 = qv->ne[0]*qv->ne[1];
-            const bool ok = conv->type == GGML_TYPE_F32 && conv->ne[1] == 1 && conv->ne[2] == 1 && conv->src[0]->ne[2] == 1 &&
+            const int64_t n_t = conv->ne[1];
+            const bool ok = conv->type == GGML_TYPE_F32 && n_t >= 1 && n_t <= 8 && conv->ne[2] == 1 && conv->src[0]->ne[2] == 1 &&
                 ggml_is_contiguous(conv->src[0]) && ggml_is_contiguous(conv->src[1]) && ggml_is_contiguous(n[1]) &&
-                conv->src[0]->ne[0] == conv->src[1]->ne[0] && (conv->src[1]->ne[0] == 3 || conv->src[1]->ne[0] == 4) &&
+                conv->src[0]->ne[0] == conv->src[1]->ne[0] - 1 + n_t && (conv->src[1]->ne[0] == 3 || conv->src[1]->ne[0] == 4) &&
                 nch % 128 == 0 &&
-                qv->ne[0] == 128 && kv->ne[0] == 128 && qv->ne[1] == kv->ne[1] && qv->ne[2] == 1 && qv->ne[3] == 1 &&
-                kv->ne[2] == 1 && kv->ne[3] == 1 && qv->nb[1] == 128*sizeof(float) && kv->nb[1] == 128*sizeof(float) &&
+                qv->ne[0] == 128 && kv->ne[0] == 128 && qv->ne[1] == kv->ne[1] && qv->ne[2] == n_t && qv->ne[3] == 1 &&
+                kv->ne[2] == n_t && kv->ne[3] == 1 && qv->nb[1] == 128*sizeof(float) && kv->nb[1] == 128*sizeof(float) &&
+                qv->nb[2] == nch*sizeof(float) && kv->nb[2] == nch*sizeof(float) &&
                 qv->view_offs == 0 && kv->view_offs == (size_t) n_l2*sizeof(float) && 2*n_l2 <= nch &&
                 eps_q == eps_k && s_q == s_k && b_q == 0.0f && b_k == 0.0f &&
                 n[4]->type == GGML_TYPE_F32 && n[7]->type == GGML_TYPE_F32 && ggml_is_contiguous(n[4]) && ggml_is_contiguous(n[7]) &&
