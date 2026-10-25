@@ -205,3 +205,85 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+// One token: ssm_conv + silu and the L2 norm (rms_norm + scale) of the q and k heads in one launch. One block per head
+// (row_len channels, one thread each). Same expressions and summation order as ssm_conv_f32 (token 0, no bias) and
+// rms_norm_f32<32, 1, do_vec, scale> (float4 per thread, warp sum), so the results are the same as unfused.
+template <int d_conv>
+static __global__ void ssm_conv_silu_l2_f32(
+        const float * __restrict__ x, const int stride_x, const float * __restrict__ w, const int stride_w,
+        float * __restrict__ y, float * __restrict__ q_out, float * __restrict__ k_out, const int n_l2,
+        const float eps, const float scale_out) {
+    constexpr int row_len = 128;
+    __shared__ float4 s_row[row_len/4];
+    __shared__ float  s_scale;
+
+    const int tid = threadIdx.x;
+    const int c   = blockIdx.x*row_len + tid;
+
+    float xv[d_conv];
+    float wv[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wv[j] = w[c*stride_w + j];
+    }
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        xv[j] = x[c*stride_x + j];
+    }
+    float sumf = 0.0f;
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        sumf += xv[j] * wv[j];
+    }
+    sumf += 0.0f;
+    const float v = ggml_cuda_op_silu_single(sumf);
+    y[c] = v;
+
+    // q heads, then k heads, then v (no norm); block-uniform
+    const int c0 = blockIdx.x*row_len;
+    if (c0 >= 2*n_l2) {
+        return;
+    }
+    ((float *) s_row)[tid] = v;
+    __syncthreads();
+    if (tid < row_len/4) {
+        const float4 xs = s_row[tid];
+        float tmp = xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+        tmp = warp_reduce_sum<WARP_SIZE>(tmp);
+        if (tid == 0) {
+            s_scale = rsqrtf(tmp / row_len + eps);
+        }
+    }
+    __syncthreads();
+    float r = s_scale*v;
+    r *= scale_out;
+    if (c0 < n_l2) {
+        q_out[c] = r;
+    } else {
+        k_out[c - n_l2] = r;
+    }
+}
+
+void ggml_cuda_op_ssm_conv_silu_l2(ggml_backend_cuda_context & ctx, const ggml_tensor * conv, ggml_tensor * silu,
+        ggml_tensor * q_out, ggml_tensor * k_out, const int n_l2, const float eps, const float scale_out) {
+    const ggml_tensor * src0 = conv->src[0];   // conv input [d_conv, nch]
+    const ggml_tensor * src1 = conv->src[1];   // weights [d_conv, nch]
+    const int d_conv = src1->ne[0];
+    const int nch    = src1->ne[1];
+    GGML_ASSERT(nch % 128 == 0 && n_l2 % 128 == 0 && 2*n_l2 <= nch);
+    GGML_ASSERT(src0->ne[0] == d_conv && src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float));
+
+    const int stride_x = src0->nb[1]/sizeof(float);
+    const int stride_w = src1->nb[1]/sizeof(float);
+    const float * x = (const float *) src0->data;
+    const float * w = (const float *) src1->data;
+    float * y = (float *) silu->data;
+    float * q = (float *) q_out->data;
+    float * k = (float *) k_out->data;
+    switch (d_conv) {
+        case 3: ssm_conv_silu_l2_f32<3><<<nch/128, 128, 0, ctx.stream()>>>(x, stride_x, w, stride_w, y, q, k, n_l2, eps, scale_out); break;
+        case 4: ssm_conv_silu_l2_f32<4><<<nch/128, 128, 0, ctx.stream()>>>(x, stride_x, w, stride_w, y, q, k, n_l2, eps, scale_out); break;
+        default: GGML_ABORT("unsupported d_conv %d", d_conv);
+    }
+}

@@ -4761,6 +4761,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // delta net, one token: ssm_conv + silu, then the q / k L2 norms (rms_norm + scale over 128-wide heads) in one launch
+    if (node->op == GGML_OP_SSM_CONV && i + 8 <= cgraph->n_nodes) {
+        static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_NO_CONV_L2_FUSION");
+        const ggml_op ops[] = { GGML_OP_SSM_CONV, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_RMS_NORM, GGML_OP_SCALE,
+                                GGML_OP_VIEW, GGML_OP_RMS_NORM, GGML_OP_SCALE };
+        const int outputs[] = { i + 1, i + 4, i + 7 };
+        ggml_tensor * const * n = cgraph->nodes + i;
+        if (!disabled && ggml_can_fuse_subgraph(cgraph, i, 8, ops, outputs, 3) &&
+                ggml_get_unary_op(n[1]) == GGML_UNARY_OP_SILU && n[1]->src[0] == n[0] &&
+                n[2]->view_src == n[1] && n[3]->src[0] == n[2] && n[4]->src[0] == n[3] &&
+                n[5]->view_src == n[1] && n[6]->src[0] == n[5] && n[7]->src[0] == n[6]) {
+            const ggml_tensor * conv = n[0];
+            const int64_t nch = conv->ne[0];
+            float eps_q, eps_k, s_q, s_k, b_q, b_k;
+            memcpy(&eps_q, n[3]->op_params, sizeof(float));
+            memcpy(&eps_k, n[6]->op_params, sizeof(float));
+            memcpy(&s_q, (const float *) n[4]->op_params + 0, sizeof(float));
+            memcpy(&b_q, (const float *) n[4]->op_params + 1, sizeof(float));
+            memcpy(&s_k, (const float *) n[7]->op_params + 0, sizeof(float));
+            memcpy(&b_k, (const float *) n[7]->op_params + 1, sizeof(float));
+            const ggml_tensor * qv = n[2];
+            const ggml_tensor * kv = n[5];
+            const int64_t n_l2 = qv->ne[0]*qv->ne[1];
+            const bool ok = conv->type == GGML_TYPE_F32 && conv->ne[1] == 1 && conv->ne[2] == 1 && conv->src[0]->ne[2] == 1 &&
+                ggml_is_contiguous(conv->src[0]) && ggml_is_contiguous(conv->src[1]) && ggml_is_contiguous(n[1]) &&
+                conv->src[0]->ne[0] == conv->src[1]->ne[0] && (conv->src[1]->ne[0] == 3 || conv->src[1]->ne[0] == 4) &&
+                nch % 128 == 0 &&
+                qv->ne[0] == 128 && kv->ne[0] == 128 && qv->ne[1] == kv->ne[1] && qv->ne[2] == 1 && qv->ne[3] == 1 &&
+                kv->ne[2] == 1 && kv->ne[3] == 1 && qv->nb[1] == 128*sizeof(float) && kv->nb[1] == 128*sizeof(float) &&
+                qv->view_offs == 0 && kv->view_offs == (size_t) n_l2*sizeof(float) && 2*n_l2 <= nch &&
+                eps_q == eps_k && s_q == s_k && b_q == 0.0f && b_k == 0.0f &&
+                n[4]->type == GGML_TYPE_F32 && n[7]->type == GGML_TYPE_F32 && ggml_is_contiguous(n[4]) && ggml_is_contiguous(n[7]) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 8, outputs, 3);
+            if (ok) {
+                ggml_cuda_op_ssm_conv_silu_l2(*cuda_ctx, conv, n[1], n[4], n[7], n_l2, eps_q, s_q);
+                return 7;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;

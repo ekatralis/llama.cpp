@@ -4320,6 +4320,56 @@ struct test_unary_mul : public test_case {
     }
 };
 
+// Delta-net conv of one token: ssm_conv + silu, then the L2 norm (rms_norm + scale) of the q and k heads,
+// in the Qwen3.5 graph order (some backends run it in one launch).
+struct test_gdn_conv_l2 : public test_case {
+    const int64_t d_conv;
+    const int64_t n_heads_k;
+    const int64_t nch;
+
+    ggml_tensor * silu = nullptr;
+    ggml_tensor * q    = nullptr;
+    ggml_tensor * k    = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_CONV_L2";
+    }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { silu, q, k }; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(d_conv, n_heads_k, nch);
+    }
+
+    test_gdn_conv_l2(int64_t d_conv = 4, int64_t n_heads_k = 16, int64_t nch = 10240)
+        : d_conv(d_conv), n_heads_k(n_heads_k), nch(nch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hd = 128;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv, nch, 1);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nch);
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+
+        silu = ggml_silu(ctx, ggml_ssm_conv(ctx, x, w));
+        ggml_set_name(silu, "silu");
+
+        const size_t nb1 = ggml_row_size(GGML_TYPE_F32, hd);
+        ggml_tensor * qv = ggml_view_4d(ctx, silu, hd, n_heads_k, 1, 1, nb1, nb1*nch/hd, nb1*nch/hd, 0);
+        ggml_tensor * kv = ggml_view_4d(ctx, silu, hd, n_heads_k, 1, 1, nb1, nb1*nch/hd, nb1*nch/hd, n_heads_k*nb1);
+        const float eps = 1e-6f;
+        q = ggml_scale(ctx, ggml_rms_norm(ctx, qv, eps/hd), 1.0f/sqrtf((float) hd));
+        k = ggml_scale(ctx, ggml_rms_norm(ctx, kv, eps/hd), 1.0f/sqrtf((float) hd));
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+
+        ggml_tensor * out = ggml_add(ctx, q, k);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Delta-net alpha / beta projections of one activation, in the Qwen3.5 graph order: mul_mat + reshape +
 // add(dt) + softplus + mul(a) + reshape and mul_mat + reshape + sigmoid (some backends run both in one launch).
 struct test_gdn_beta_alpha : public test_case {
@@ -10069,6 +10119,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
 
+    test_cases.emplace_back(new test_gdn_conv_l2(4, 16, 10240));
+    test_cases.emplace_back(new test_gdn_conv_l2(4, 2, 1024));
+    test_cases.emplace_back(new test_gdn_conv_l2(3, 4, 1536));
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
         for (int64_t n_tokens : { 1, 2, 3, 4, 5 }) {
             test_cases.emplace_back(new test_gdn_beta_alpha(type, 48, 5120, n_tokens));
