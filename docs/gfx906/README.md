@@ -427,6 +427,60 @@ Remaining in the 3-token pass: Q4_K ~1.65 ms and Q5_K below 16384 rows ~0.7 ms o
 head 1.15 ms (1 column there, ~770 GB/s, near the limit). Small fusions not done yet: the q / k L2
 norms into the delta-net kernel, ssm_conv into the conv-state concat, the gated norm.
 
+### Small-kernel fusion round 2 (2026-10-25, edb1def, 19d64c7, e919904, a565517)
+
+Generation profile after e192e1e: GPU 26.2 ms per token, matvec ~22 ms, the rest ~4.5 ms in ~1250
+kernels per token, most of them 4-5 us (near the fixed cost of a launch on this GPU). So the lever
+is fewer kernels. Per-token profiles below: `rocprofv3 --kernel-trace` of `llama-bench -p 0 -n 64`.
+
+- edb1def / e919904: ssm_conv + silu and the q / k L2 norms (rms_norm + scale over 128-wide heads)
+  in one kernel, one block per head and token, 1-8 tokens. Sums in the order of ssm_conv_f32 and
+  rms_norm_f32<32, 1, do_vec> (float4 per thread, 32-lane reduction). 4.7 us instead of
+  4.9 + 2 x 4.0 us per layer. tg128 36.86 -> 37.42. Off with `GGML_CUDA_NO_CONV_L2_FUSION=1`.
+  Test: GDN_CONV_L2.
+- 19d64c7: rms_norm * mul writes the q8_1 copy for the next MMVQ. 6cdfbae found this not faster
+  with one block per row (the quantize serializes); now ncols/1024 blocks per row, each sums the
+  whole row in the order of rms_norm_f32<1024, 4> (same scale) and normalizes and quantizes a
+  1024-column slice, one value per thread. 4.9 us instead of 6.9 (norm) + 3.8 us (quantize), 129
+  times per token. tg128 37.45 -> 38.25 (A/B back to back). Off with `GGML_CUDA_NO_NORM_Q8=1`.
+  Test: RMS_NORM_MUL_MAT.
+- a565517: the residual add after the 5120-row output projections fused into the 2-4 column hw
+  MMVQ (bias column stride as a new fusion arg). `ggml_cuda_mmvq_fuses_bias_multi` mirrors the hw
+  dispatch; the dispatch asserts that a multi-column bias without ids never reaches another
+  kernel (MUL_MAT_ID passes per-expert biases, the first version of the assert caught those in
+  MUL_MAT_VEC_FUSION). 111 of the 127 adds of a 3-token pass (Q4_K / Q5_K stay on ysh).
+  Test: MUL_MAT_ADD_RESIDUAL.
+- 3-token pass: GPU 33.98 -> 33.43 ms, 1377 -> 1170 kernels. Note: `llama-bench -p 3` starts a new
+  sequence each time, which zeroes the recurrent states (96 x 8 us scale_f32, 0.77 ms per pass);
+  a MTP verify continues a sequence and does not run them. Pass times in this log include them.
+- All four leave the logits unchanged: KLD vs the unfused path at the run-to-run noise floor
+  (0.000001, max 0.000059), KLD vs stock at ubatch 1 / 3 / 4 the same as at e192e1e.
+
+Tried and dropped:
+- Gated norm (rms_norm * w per head, then silu(z) * norm, with the z mat-vec in between): ran the z
+  mat-vec first, then one kernel for norm + gate + q8_1 copy. GPU time -0.22 ms per token, 48 fewer
+  kernels, but tg128 unchanged in three alternating A/B runs (38.28 / 38.22 / 38.18 vs 38.22 /
+  38.21 / 38.31). Not understood; reverted.
+- sincosf instead of sinf + cosf in rope: rope_multi stays at 9.8 us. Its code is ~1900
+  instructions with ~20 branches (mrope sections), runs once per layer; likely instruction
+  cache misses. Not pursued.
+
+Results (fa=1):
+
+| | e192e1e | a565517 |
+|---|---:|---:|
+| tg128 / tg128 @ d8192 | 36.86 / 34.73 | 38.40 / 35.60 |
+| pp512 / pp512 @ d8192 | 385 / 343 | 385 / 343 |
+| llama-server, no MTP | 36.2 / 36.3 t/s | 37.7 / 37.6 t/s |
+| llama-server, MTP draft 2 | 58.8 / 55.2 t/s | 60.6 / 56.8 t/s |
+| llama-server, MTP draft 3 | 56.6 / 51.4 t/s | 58.2 / 52.7 t/s |
+
+Tests: full suite 18864/18941, only TOPK_MOE (77, flaky as stock); `ops/qwen38_ncols_mm.txt`
+129/129. Remaining non-matvec per token (~3.5 ms): delta net 0.64 ms, flash attention 0.41,
+gated ops 0.37, rope 0.32 (slow kernel, see above), conv state concat 0.27, gated norm 0.22,
+attention q / k norm 0.16, K / V set_rows 0.13. In the 3-token pass also SWIGLU (gate / up
+are fused only for 1 column) and the remaining adds.
+
 ### Output reference points (vs stock upstream f5027fb)
 
 Measured with `kld-check.sh` (KL divergence of the logits vs stock; ubatch 512 = prompt kernels,
@@ -439,6 +493,7 @@ Measured with `kld-check.sh` (KL divergence of the logits vs stock; ubatch 512 =
 | cf35d3b .. | same as stock (rechecked at 97d07dd) | differs: KLD 0.000384, same top 97.8% |
 | e64e5f4 .. | same as stock | ubatch 1 as cf35d3b; ubatch 3 / 4: KLD 0.000348 / 0.000328 |
 | 009bc7d, e192e1e .. | same as stock (rechecked at e192e1e) | ubatch 1 / 3 / 4: KLD 0.000298 / 0.000301 / 0.000299, same top 97.8-98.6% |
+| edb1def .. a565517 | same as stock | same as e192e1e (KLD vs the unfused path at the noise floor) |
 
 - Generation output has not been bit-identical to stock since the first fork commit a25d385
   (batch-1 MMVQ launch shape 2 -> 1 warps changes the float summation order). The size is the same
@@ -667,6 +722,7 @@ upstream on ~900 KB of repo docs (`/opt/gfx906-tools/kld-text.txt`), c = 512.
 | + y from VRAM for K-quant / q8_0_16 vec dots | 372.0 | 30.48 | 331.8 | 29.15 |
 | + GDN k prefetch, tiled transposed concat | 386.4 | 30.41 | 343.3 | 29.09 |
 | branch gfx906-qwen38 at e192e1e (fusions, half-wave MMVQ, alpha / beta pair) | 385.3 | 36.86 | 342.6 | 34.73 |
+| branch gfx906-qwen38 at a565517 (fusion round 2) | 385.2 | 38.40 | 342.9 | 35.60 |
 
 Tests after each change: `test-backend-ops test -b ROCm0 -o MUL_MAT,MUL_MAT_ID` (3376/3376)
 and `--test-file ops/qwen38_tg_mm.txt` (43/43).
