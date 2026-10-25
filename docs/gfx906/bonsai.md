@@ -92,7 +92,8 @@ KL divergence vs CPU logits (`HIP_VISIBLE_DEVICES=-1 llama-perplexity ... -ngl 0
 
 The stock prompt path (ub 512: MMQ, FWHT on 512 columns, chunked GDN, FA) is ~30x further from CPU than the
 generation path; for Qwen3.8 Q3_K_XL on upstream the same ub 512 vs ub 1 gap is 0.0007. PPL ratio 1.0045 +- 0.0028,
-so small but a stock-fork issue worth a look (not investigated yet).
+so small but a stock-fork issue. Cause: on HIP PTQ1_0 prompts run fp16 dequantize + rocBLAS with fp16 activations
+(no PTQ1_0 MMQ on HIP); fixed on gfx906 by `58543948f`, see "Prompt processing".
 
 ## Step 3: stock performance
 
