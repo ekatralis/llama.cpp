@@ -65,6 +65,25 @@ static __device__ __forceinline__ int int4_at(const int4 & v, const int k) {
     }
 }
 
+// CUDA __byte_perm semantics; on HIP one v_perm_b32 (operands swapped, selector nibbles widened to bytes)
+static __device__ __forceinline__ uint32_t ptq1_0_byte_perm(const uint32_t x, const uint32_t y, const uint32_t s) {
+#if defined(GGML_USE_HIP)
+    const uint32_t sa = (s & 0xF) | (((s >> 4) & 0xF) << 8) | (((s >> 8) & 0xF) << 16) | (((s >> 12) & 0xF) << 24);
+    return __builtin_amdgcn_perm(y, x, sa);
+#else
+    return __byte_perm(x, y, s);
+#endif
+}
+
+// dot of four digit bytes (0..2) with four signed bytes; the digits fit int8, so HIP can use the signed dp4a
+static __device__ __forceinline__ int ptq1_0_dot_digits(const uint32_t q, const int u, const int c) {
+#if defined(GGML_USE_HIP)
+    return ggml_cuda_dp4a((int) q, u, c);
+#else
+    return ggml_cuda_dp4a_us(q, u, c);
+#endif
+}
+
 // one base-3 digit step on four bytes held as two 16-bit-lane words:
 // returns the raw digits (0, 1, 2) as four unsigned bytes, advances the remainders.
 // The digit bias is not applied here: the dot product uses the digits as-is with a mixed-sign
@@ -75,7 +94,7 @@ static __device__ __forceinline__ uint32_t ptq1_0_trit_step(uint32_t & vlo, uint
     const uint32_t whi = vhi * 3;
     vlo = wlo & 0x00FF00FF;
     vhi = whi & 0x00FF00FF;
-    return __byte_perm(wlo, whi, 0x7531);
+    return ptq1_0_byte_perm(wlo, whi, 0x7531);
 }
 
 // Dot products of nrows PTQ1_0 blocks with the same block index of ncols
@@ -134,8 +153,8 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
 #pragma unroll
         for (int g = 0; g < 4; ++g) {
             const uint32_t packed = get_int_b4(bq[i]->qs, g);
-            vlo[i][g] = __byte_perm(packed, 0, 0x4140);
-            vhi[i][g] = __byte_perm(packed, 0, 0x4342);
+            vlo[i][g] = ptq1_0_byte_perm(packed, 0, 0x4140);
+            vhi[i][g] = ptq1_0_byte_perm(packed, 0, 0x4342);
         }
     }
 #pragma unroll
@@ -152,7 +171,7 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
                 const uint32_t q = ptq1_0_trit_step(vlo[i][g], vhi[i][g]);
 #pragma unroll
                 for (int j = 0; j < ncols; ++j) {
-                    sumi[j][i] = ggml_cuda_dp4a_us(q, int4_at(u[j], g), sumi[j][i]);
+                    sumi[j][i] = ptq1_0_dot_digits(q, int4_at(u[j], g), sumi[j][i]);
                 }
             }
         }
@@ -173,8 +192,8 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
 #pragma unroll
         for (int g = 0; g < 2; ++g) {
             const uint32_t packed = get_int_b4(bq[i]->qs + 16, g);
-            vlo2[i][g] = __byte_perm(packed, 0, 0x4140);
-            vhi2[i][g] = __byte_perm(packed, 0, 0x4342);
+            vlo2[i][g] = ptq1_0_byte_perm(packed, 0, 0x4140);
+            vhi2[i][g] = ptq1_0_byte_perm(packed, 0, 0x4342);
         }
     }
     int4 u2[ncols];
@@ -194,7 +213,7 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
                 const int w = 20 + 2*t + g; // word index within the 128-element block
 #pragma unroll
                 for (int j = 0; j < ncols; ++j) {
-                    sumi[j][i] = ggml_cuda_dp4a_us(q, int4_at(u2[j], w & 3), sumi[j][i]);
+                    sumi[j][i] = ptq1_0_dot_digits(q, int4_at(u2[j], w & 3), sumi[j][i]);
                 }
             }
         }
@@ -214,10 +233,10 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
             v                 = w0 & 0x00FF00FF;
             const uint32_t w1 = v * 3;
             v                 = w1 & 0x00FF00FF;
-            const uint32_t q = __byte_perm(w0, w1, 0x7531);
+            const uint32_t q = ptq1_0_byte_perm(w0, w1, 0x7531);
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                sumi[j][i] = ggml_cuda_dp4a_us(q, int4_at(u2[j], 2 + t/2), sumi[j][i]);
+                sumi[j][i] = ptq1_0_dot_digits(q, int4_at(u2[j], 2 + t/2), sumi[j][i]);
             }
         }
     }

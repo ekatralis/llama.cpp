@@ -1303,7 +1303,23 @@ static inline bool ggml_cuda_pq2_multicol(int ncols_dst) {
 #endif
 }
 
+// gfx906 one-column PTQ1_0 / PQ2_0 mat-vec (mul_mat_vec_q_lg in mmvq.cu) reads the PT / PQ2 layouts
+static inline bool ggml_cuda_gfx906_lg_layout(ggml_type type_src0, int ncols_dst, bool has_ids, bool plain_2d) {
+#if defined(GGML_USE_HIP)
+    static const bool disabled = getenv("GGML_CUDA_NO_MMVQ_HW") != nullptr;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return !disabled && cc == GGML_CUDA_CC_VEGA20 && ncols_dst == 1 && !has_ids && plain_2d &&
+        (type_src0 == GGML_TYPE_PTQ1_0 || type_src0 == GGML_TYPE_PQ2_0);
+#else
+    GGML_UNUSED_VARS(type_src0, ncols_dst, has_ids, plain_2d);
+    return false;
+#endif
+}
+
 static inline ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_host(ggml_type type_src0, int ncols_dst, bool has_ids, bool plain_2d = true) {
+    if (ggml_cuda_gfx906_lg_layout(type_src0, ncols_dst, has_ids, plain_2d)) {
+        return type_src0 == GGML_TYPE_PTQ1_0 ? GGML_CUDA_Q8_1_PT : GGML_CUDA_Q8_1_PQ2;
+    }
     if (type_src0 == GGML_TYPE_PQ2_0 && plain_2d && !has_ids && ggml_cuda_pq2_multicol(ncols_dst)) {
         return GGML_CUDA_Q8_1_PQ2;
     }
