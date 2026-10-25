@@ -4222,6 +4222,7 @@ struct test_mul_mat_vec_pair : public test_case {
     const ggml_type type;
     const int64_t   k;
     const int64_t   m;
+    const int64_t   n;
     std::vector<ggml_tensor *> outs;
 
     std::string op_desc(ggml_tensor * t) override {
@@ -4230,7 +4231,7 @@ struct test_mul_mat_vec_pair : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR3(type, k, m);
+        return n == 1 ? VARS_TO_STR3(type, k, m) : VARS_TO_STR4(type, k, m, n);
     }
 
     bool run_whole_graph() override { return true; }
@@ -4239,10 +4240,11 @@ struct test_mul_mat_vec_pair : public test_case {
 
     double max_nmse_err() override { return 5e-4; }
 
-    test_mul_mat_vec_pair(ggml_type type = GGML_TYPE_F32, int64_t k = 1024, int64_t m = 8) : type(type), k(k), m(m) {}
+    test_mul_mat_vec_pair(ggml_type type = GGML_TYPE_F32, int64_t k = 1024, int64_t m = 8, int64_t n = 1)
+        : type(type), k(k), m(m), n(n) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_tensor * x  = n == 1 ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
         ggml_set_name(x, "x");
         ggml_tensor * wa = ggml_new_tensor_2d(ctx, type, k, m);
         ggml_set_name(wa, "wa");
@@ -10112,6 +10114,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_pair(t, 1024, 8));
         test_cases.emplace_back(new test_mul_mat_vec_pair(t, 3072, 24));
         test_cases.emplace_back(new test_mul_mat_vec_pair(t, 130, 3));
+        for (int64_t n : { 2, 3, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_pair(t, 5120, 48, n)); // GDN alpha / beta, MTP verify
+        }
     }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
