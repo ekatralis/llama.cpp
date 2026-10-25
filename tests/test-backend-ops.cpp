@@ -4146,7 +4146,9 @@ struct test_gdn_conv_chain : public test_case {
     const int64_t n_qk_rows; // q + k heads
     const int64_t n_ch;      // all channels (q, k and v)
     const int     src_row;   // cache row read
-    const int     dst_row;   // cache row written
+    const int     dst_row;   // cache row written (the newest snapshot slot with K > 1)
+    const int64_t n_t;       // tokens
+    const int64_t K;         // conv-state copies (rollback snapshots), as build_conv_state with n_rs_seq = K - 1
     std::vector<ggml_tensor *> outs;
 
     std::string op_desc(ggml_tensor * t) override {
@@ -4155,7 +4157,10 @@ struct test_gdn_conv_chain : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR6(d_conv, head_dim, n_qk_rows, n_ch, src_row, dst_row);
+        if (n_t == 1 && K == 1) {
+            return VARS_TO_STR6(d_conv, head_dim, n_qk_rows, n_ch, src_row, dst_row);
+        }
+        return VARS_TO_STR8(d_conv, head_dim, n_qk_rows, n_ch, src_row, dst_row, n_t, K);
     }
 
     bool run_whole_graph() override { return true; }
@@ -4163,16 +4168,17 @@ struct test_gdn_conv_chain : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
 
     test_gdn_conv_chain(int64_t d_conv = 4, int64_t head_dim = 128, int64_t n_qk_rows = 32, int64_t n_ch = 5120,
-            int src_row = 1, int dst_row = 1)
-        : d_conv(d_conv), head_dim(head_dim), n_qk_rows(n_qk_rows), n_ch(n_ch), src_row(src_row), dst_row(dst_row) {}
+            int src_row = 1, int dst_row = 1, int64_t n_t = 1, int64_t K = 1)
+        : d_conv(d_conv), head_dim(head_dim), n_qk_rows(n_qk_rows), n_ch(n_ch), src_row(src_row), dst_row(dst_row),
+          n_t(n_t), K(K) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t n_rows = 3;
+        const int64_t n_rows = 3 + K;
         ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1) * n_ch, n_rows);
         ggml_set_name(cache, "cache");
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         ggml_set_name(ids, "ids");
-        ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_ch);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_t);
         ggml_set_name(x, "x");
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_ch);
         ggml_set_name(w, "w");
@@ -4180,24 +4186,33 @@ struct test_gdn_conv_chain : public test_case {
         ggml_tensor * state = ggml_get_rows(ctx, cache, ids);
         state = ggml_reshape_3d(ctx, state, d_conv - 1, n_ch, 1);
         x = ggml_scale(ctx, x, 1.0f); // a computed tensor, as the projection is in the model
-        ggml_tensor * xt = ggml_transpose(ctx, ggml_reshape_3d(ctx, x, n_ch, 1, 1));
+        ggml_tensor * xt = ggml_transpose(ctx, ggml_reshape_3d(ctx, x, n_ch, n_t, 1));
         ggml_tensor * conv_input = ggml_concat(ctx, state, xt, 0);
 
-        ggml_tensor * last = ggml_view_3d(ctx, conv_input, d_conv - 1, n_ch, 1, conv_input->nb[1], conv_input->nb[2],
-                                          ggml_row_size(conv_input->type, 1));
-        ggml_tensor * upd = ggml_view_2d(ctx, cache, (d_conv - 1) * n_ch, 1, cache->nb[1], dst_row * cache->nb[1]);
-        ggml_tensor * cpy = ggml_cpy(ctx, last, upd);
-        if (gf) {
-            ggml_build_forward_expand(gf, cpy);
+        // the newest window goes to dst_row, older snapshot slots to the rows after it (build_conv_state)
+        outs.clear();
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx = std::max<int64_t>(0, n_t - K + t);
+            const int64_t slot  = K - t;
+            ggml_tensor * last = ggml_view_3d(ctx, conv_input, d_conv - 1, n_ch, 1, conv_input->nb[1], conv_input->nb[2],
+                                              ggml_row_size(conv_input->type, s_idx));
+            ggml_tensor * upd = ggml_view_2d(ctx, cache, (d_conv - 1) * n_ch, 1, cache->nb[1],
+                                             (slot == 0 ? dst_row : 2 + slot) * cache->nb[1]);
+            ggml_tensor * cpy = ggml_cpy(ctx, last, upd);
+            if (gf) {
+                ggml_build_forward_expand(gf, cpy);
+            }
+            outs.push_back(cpy);
         }
 
         ggml_tensor * y  = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
-        ggml_tensor * qk = ggml_view_4d(ctx, y, head_dim, n_qk_rows, 1, 1, ggml_row_size(y->type, head_dim), y->nb[1],
-                                        y->nb[2], 0);
+        ggml_tensor * qk = ggml_view_4d(ctx, y, head_dim, n_qk_rows, n_t, 1, ggml_row_size(y->type, head_dim),
+                                        ggml_row_size(y->type, n_ch), ggml_row_size(y->type, n_ch * n_t), 0);
         ggml_tensor * out = ggml_l2_norm(ctx, qk, 1e-6f);
         ggml_set_name(out, "out");
 
-        outs = { out, y, cpy };
+        outs.push_back(out);
+        outs.push_back(y);
         return out;
     }
 
@@ -10110,6 +10125,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_conv_chain(4, 256, 8, 4096 + 2048, 1, 0));
     test_cases.emplace_back(new test_gdn_conv_chain(3, 64, 4, 512, 1, 1));
     test_cases.emplace_back(new test_gdn_conv_chain(5, 32, 6, 256, 0, 1));
+    for (auto [n_t, K] : std::vector<std::pair<int64_t, int64_t>>{ {1, 3}, {2, 1}, {3, 3}, {4, 4}, {3, 2}, {8, 3}, {9, 3} }) {
+        test_cases.emplace_back(new test_gdn_conv_chain(4, 128, 32, 10240, 1, 1, n_t, K)); // Qwen3.8 / Bonsai shape
+    }
     for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_mul_mat_vec_pair(t, 1024, 8));
         test_cases.emplace_back(new test_mul_mat_vec_pair(t, 3072, 24));

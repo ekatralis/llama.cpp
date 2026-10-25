@@ -207,17 +207,13 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 
 // GDN decode conv chain in one launch (see ggml_cuda_gdn_conv_fusion in ggml-cuda.cu): the conv-state row gather, the
 // concat with the new token, the conv-state write-back, the depthwise conv + SiLU and the L2 norm of the q/k heads.
-// One thread per channel, one block per L2 row (head). Every value is computed with the same expression, in the same
-// order, as the unfused kernels: the conv sum as ssm_conv_f32 (token 0, no bias), the L2 norm as l2_norm_f32 with
-// WARP_SIZE threads (per-lane strided partial sums, then the warp butterfly), so the outputs are bit-identical.
-template <int d_conv>
-static __global__ void ssm_conv_gdn_fused_f32(
-        const float * __restrict__ cache, const int32_t * __restrict__ ids, const int64_t row_stride,
-        const float * x, const int64_t x_stride,
-        const float * __restrict__ w, const int w_stride,
-        float * __restrict__ cache_dst,
-        float * y,
-        float * __restrict__ l2, const int n_l2, const float eps) {
+// One thread per channel (all tokens), one block per L2 row (head). Every value is computed with the same expression,
+// in the same order, as the unfused kernels: the conv sum as ssm_conv_f32 (sliding window, no bias), the L2 norm as
+// l2_norm_f32 with WARP_SIZE threads (per-lane strided partial sums, then the warp butterfly), so the outputs are
+// bit-identical. Each thread reads its channel's state and inputs before any write, so the state row and the inputs may
+// be written in place.
+template <int d_conv, int n_t>
+static __global__ void ssm_conv_gdn_fused_f32(const ggml_cuda_ssm_conv_gdn_fused_args a) {
     ggml_cuda_pdl_lc();
     extern __shared__ float smem[]; // [blockDim.x] silu outputs of this row, then the row scale
 
@@ -226,69 +222,94 @@ static __global__ void ssm_conv_gdn_fused_f32(
 
     ggml_cuda_pdl_sync();
 
-    const float * s = cache + ids[0]*row_stride + (int64_t) c*(d_conv - 1);
+    const float * s = a.cache + a.ids[0]*a.row_stride + (int64_t) c*(d_conv - 1);
 
-    float xw[d_conv];
+    float xw[d_conv - 1 + n_t];
     float ww[d_conv];
 #pragma unroll
     for (int j = 0; j < d_conv - 1; ++j) {
         xw[j] = s[j];
     }
-    xw[d_conv - 1] = x[c*x_stride];
+#pragma unroll
+    for (int t = 0; t < n_t; ++t) {
+        xw[d_conv - 1 + t] = a.x[c*a.x_stride + t*a.x_tstride];
+    }
 #pragma unroll
     for (int j = 0; j < d_conv; ++j) {
-        ww[j] = w[c*w_stride + j];
+        ww[j] = a.w[c*a.w_stride + j];
     }
 
-    // conv-state write-back: the last d_conv - 1 inputs (the same row when ids[0] is the destination row: this thread
-    // read its values above)
+    // conv-state write-backs: the window starting at dst_off of each snapshot row
+    for (int k = 0; k < a.n_dst; ++k) {
+        float * dst = a.cache_dst[k] + (int64_t) c*(d_conv - 1);
 #pragma unroll
-    for (int j = 0; j < d_conv - 1; ++j) {
-        cache_dst[(int64_t) c*(d_conv - 1) + j] = xw[j + 1];
-    }
-
-    const float b = 0.0f; // ssm_conv_f32 adds its (absent) bias as 0.0f
-    float sumf = 0.0f;
+        for (int o = 0; o <= n_t; ++o) {
+            if (o == a.dst_off[k]) {
 #pragma unroll
-    for (int j = 0; j < d_conv; ++j) {
-        sumf += xw[j] * ww[j];
-    }
-    sumf += b;
-    const float v = ggml_cuda_op_silu_single(sumf);
-    y[c] = v;
-
-    if (blockIdx.x*blockDim.x >= n_l2) {
-        return; // a v channel block: no L2 norm (block-uniform)
-    }
-
-    smem[tid] = v;
-    __syncthreads();
-    if (tid < WARP_SIZE) {
-        float tmp = 0.0f;
-        for (int col = tid; col < (int) blockDim.x; col += WARP_SIZE) {
-            const float xi = smem[col];
-            tmp += xi * xi;
-        }
-        tmp = warp_reduce_sum(tmp);
-        if (tid == 0) {
-            smem[blockDim.x] = rsqrtf(fmaxf(tmp, eps * eps));
+                for (int j = 0; j < d_conv - 1; ++j) {
+                    dst[j] = xw[o + j];
+                }
+            }
         }
     }
-    __syncthreads();
-    l2[c] = smem[blockDim.x] * v;
+
+    const bool l2_block = blockIdx.x*blockDim.x < a.n_l2; // block-uniform
+#pragma unroll
+    for (int t = 0; t < n_t; ++t) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sumf += xw[t + j] * ww[j];
+        }
+        sumf += 0.0f; // ssm_conv_f32 adds its (absent) bias as 0.0f
+        const float v = ggml_cuda_op_silu_single(sumf);
+        a.y[(int64_t) t*a.n_channels + c] = v;
+
+        if (!l2_block) {
+            continue;
+        }
+        smem[tid] = v;
+        __syncthreads();
+        if (tid < WARP_SIZE) {
+            float tmp = 0.0f;
+            for (int col = tid; col < (int) blockDim.x; col += WARP_SIZE) {
+                const float xi = smem[col];
+                tmp += xi * xi;
+            }
+            tmp = warp_reduce_sum(tmp);
+            if (tid == 0) {
+                smem[blockDim.x] = rsqrtf(fmaxf(tmp, a.eps * a.eps));
+            }
+        }
+        __syncthreads();
+        a.l2[(int64_t) t*a.n_l2 + c] = smem[blockDim.x] * v;
+        __syncthreads(); // smem is reused by the next token
+    }
 }
 
 void ggml_cuda_ssm_conv_gdn_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_ssm_conv_gdn_fused_args & a) {
     GGML_ASSERT(a.row_len % WARP_SIZE == 0 && a.row_len < 1024 && a.n_channels % a.row_len == 0 && a.n_l2 % a.row_len == 0);
+    GGML_ASSERT(a.n_tokens >= 1 && a.n_tokens <= GGML_CUDA_GDN_CONV_MAX_TOKENS && a.n_dst >= 1 && a.n_dst <= GGML_CUDA_GDN_CONV_MAX_DST);
     const dim3 blocks(a.n_channels / a.row_len, 1, 1);
     const dim3 threads(a.row_len, 1, 1);
     const size_t smem = (a.row_len + 1) * sizeof(float);
     const ggml_cuda_kernel_launch_params launch_params(blocks, threads, smem, ctx.stream());
 
+    auto launch_t = [&](auto NC, auto NT) {
+        ggml_cuda_kernel_launch(ssm_conv_gdn_fused_f32<decltype(NC)::value, decltype(NT)::value>, launch_params, a);
+    };
     auto launch = [&](auto NC) {
-        constexpr int kNC = decltype(NC)::value;
-        ggml_cuda_kernel_launch(ssm_conv_gdn_fused_f32<kNC>, launch_params, a.cache, a.ids, a.row_stride, a.x, a.x_stride,
-                                a.w, a.w_stride, a.cache_dst, a.y, a.l2, a.n_l2, a.eps);
+        switch (a.n_tokens) {
+            case 1: launch_t(NC, std::integral_constant<int, 1>{}); break;
+            case 2: launch_t(NC, std::integral_constant<int, 2>{}); break;
+            case 3: launch_t(NC, std::integral_constant<int, 3>{}); break;
+            case 4: launch_t(NC, std::integral_constant<int, 4>{}); break;
+            case 5: launch_t(NC, std::integral_constant<int, 5>{}); break;
+            case 6: launch_t(NC, std::integral_constant<int, 6>{}); break;
+            case 7: launch_t(NC, std::integral_constant<int, 7>{}); break;
+            case 8: launch_t(NC, std::integral_constant<int, 8>{}); break;
+            default: GGML_ABORT("unsupported n_tokens %d", a.n_tokens);
+        }
     };
     switch (a.d_conv) {
         case 3: launch(std::integral_constant<int, 3>{}); break;
