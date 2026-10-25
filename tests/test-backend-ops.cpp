@@ -11329,6 +11329,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_add_residual(type, 6144, 5120, n));
         }
     }
+    // GQA ratio 6 (Qwen3.8 / Bonsai 2 27B: 24 Q heads, 4 K/V heads, head size 256), decode and MTP verify widths
+    for (int64_t nb : { 1, 2, 3, 4, 5 }) {
+        for (int64_t kv : { 512, 4096 }) {
+            for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
     for (int64_t k : {196480, 196608}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 64, k,
             false, 1, 1, false, false, true, false, {1, 1}));
