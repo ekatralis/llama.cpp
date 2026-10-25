@@ -320,3 +320,159 @@ at ~850 GB/s is ~6.7 / ~8.0 ms. PQ2_0 decodes faster than PTQ1_0 despite 20% mor
   reductions would be the next step).
 - MTP: the 3-column verify mat-vec (57% of the step), unfused 3-token GDN conv chain.
 - Prompt: MMQ at ~24 TOPS (84% of a pp512 pass); at depth the flash-attention tile kernel.
+
+## Round 2: speed round (2026-10-25)
+
+### Stock reference logits (reused by every check)
+
+`/opt/gfx906-tools/bonsai/ref/<Q>_stock_ub<UB>_c4.kld` for Q in PTQ1_0, PQ2_0 and UB in 1, 3, 512 (SHA256SUMS next to
+them), made by the stock build (`prism` @ `97ea5aeee`, `build-stock`) with
+
+    /opt/gfx906-tools/gpu.sh /opt/llama.cpp-bonsai/build-stock/bin/llama-perplexity \
+        -m /opt/llms/Ternary-Bonsai-2-27B-<Q>.gguf -f /opt/gfx906-tools/kld-text.txt \
+        -c 512 -b 512 -ub <UB> --chunks 4 -fa on -ngl 99 --kl-divergence-base <Q>_stock_ub<UB>_c4.kld
+
+(stock PPL over the 4 chunks: PTQ1_0 6.0342 / 6.0368 / 6.0603 at ub 1 / 3 / 512, PQ2_0 6.0397 / 6.0412 / 6.0404).
+Check a build against them: `kld-ref.sh [build dir] ["PTQ1_0 PQ2_0"] ["1 3 512"]` (same command with
+`--kl-divergence`, prints KLD / max / same top / PPL ratio per model and ubatch). CPU references (ubatch 512, 4 chunks):
+`/opt/gfx906-tools/bonsai/kld/<Q>_cpu_ub512_c4.kld` (`HIP_VISIBLE_DEVICES=-1 ... -ngl 0 -t 16`).
+
+KLD vs the stock references at the end of the round (`c82cd0052`):
+
+| model | ub 1 | ub 3 | ub 512 |
+|---|---:|---:|---:|
+| PTQ1_0 | 0.000136 (max 0.0061, top 99.6%) | 0.000116 (top 99.1%) | 0.003767 (stock's own fp16 prompt-path error, see step 2) |
+| PQ2_0 | 0.000111 (top 98.9%) | 0.000119 (top 99.3%) | 0.000155 (top 99.1%) |
+
+### Commits
+
+| commit | change | effect |
+|---|---|---|
+| `fd1a33bd2` | our a565517: residual add fused into the 2-4 column PQ2_0 lane-group mat-vec (`x_bias_stride_col`, `ggml_cuda_mmvq_fuses_bias_multi`), test MUL_MAT_ADD_RESIDUAL | 3-token pass 26.82 -> 26.48 ms; MTP d2 64.6 / 60.9 -> 65.5 / 61.0 |
+| `a6e2b3f65` | the fork's alpha / beta mat-vec pair (one launch, second weight as channel 1) for 1-8 columns, test MUL_MAT_VEC_PAIR 2-4 columns | 3-token pass 26.48 -> 25.78 ms, bit-identical |
+| `ee6874b5f` | the fork's GDN conv chain fusion (gather + concat + state copies + ssm_conv + silu + q/k L2) for 1-8 tokens and up to 8 rollback snapshot copies (with MTP every pass writes K copies, so it never matched while serving). Test GDN_CONV_CHAIN (n_t, K) up to (8, 3) + unfused 9 | 3-token pass 25.78 -> 25.24 ms; MTP d2 -> 68.6 / 64.5, d3 60.7 / 58.0 -> 63.4 / 60.5; bit-identical |
+| `42245787e` | gfx906 DPP lane exchanges in the Hadamard butterfly (xor 1 / 2 quad_perm, 4 / 8 row shifts, 16 ds_swizzle) and DPP 32-lane max / int-sum in the fused quantizer | fused transform + quantize 6.9 -> 5.5 us (PQ2 layout), 7.8 -> 6.9 us (PT), 257 per token; bit-identical |
+| `288c5a39a` | PQ2_0 lane-group mat-vec for 5 columns (4 rows / 32-lane group, 2 waves per EU) | MTP d4 41.5 / 37.5 -> 58.6 / 53.4 |
+| `c82cd0052` | gfx906 tile FA: for 1-4 tokens and GQA 5-7 one tile of 8 Q heads per K/V head (padding columns skipped), so each K/V head is read once instead of 3 times; partial-tile indexing only in the HIP ncols2 = 8 instances. Tests: FLASH_ATTN_EXT head 256, GQA 6, 1-5 tokens; all 4355 FA cases pass | decode FA at a 33280 context 448 -> 232 us per layer; tg128 @ d8192 +6%, @ d32768 PQ2_0 39.57 -> 45.74 (+16%) |
+
+### Final before / after
+
+llama-bench `-fa 1 -p 512 -n 128`, f16 KV, 3 reps (d32768: 1 rep). Server: `mtp-test.sh` (llama-server `-c 8192`,
+greedy, 256 tokens, the two prompts of our mtp-test.sh, `ignore_eos`), MTP rows with the PQ2_0 MTP graft
+(`/opt/llms/bonsai-mtp/Bonsai-2-27B-PQ2_0-MTP.gguf`, `--spec-type draft-mtp --spec-draft-n-max N`); there is no PTQ1_0
+MTP model.
+
+| | stock `prism` | round 1 end (`7d018b4df`) | round 2 end (`c82cd0052`) |
+|---|---:|---:|---:|
+| PTQ1_0 pp512 | 193.19 | 407.42 | 407.94 |
+| PTQ1_0 tg128 | 22.74 | 51.03 | 52.56 |
+| PTQ1_0 pp512 @ d8192 | 181.43 | 359.36 | 359.01 |
+| PTQ1_0 tg128 @ d8192 | 21.25 | 48.34 | 51.44 |
+| PQ2_0 pp512 | 141.01 | 405.38 | 404.96 |
+| PQ2_0 tg128 | 33.75 | 53.82 | 53.32 |
+| PQ2_0 pp512 @ d8192 | 136.24 | 357.79 | 358.62 |
+| PQ2_0 tg128 @ d8192 | 31.99 | 49.48 | 51.82 |
+| PQ2_0 tg128 @ d32768 | 27.23 | 39.57 | 45.74 |
+| server PTQ1_0, no MTP | - | - | 51.8 / 52.0 |
+| server PQ2_0+MTP file, no MTP | 33.4 / 33.2 | 51.7 / 51.8 | 52.8 / 52.7 |
+| server MTP draft 2 | 42.9 / 40.7 | 64.6 / 60.9 | **68.8 / 64.8** |
+| server MTP draft 3 | 40.2 / 38.9 | 60.8 / 58.3 | 64.0 / 61.1 |
+| server MTP draft 4 | - | 41.5 / 37.5 | 57.8 / 53.0 |
+
+(Qwen3.8 Q3_K_XL on our fork, same test: no MTP 36.2 / 36.3, draft 2 58.8 / 55.2, draft 3 56.6 / 51.4.)
+tg128 at d0 moves within run-to-run noise (+-0.4); the FA change shows at depth.
+
+### Tried and dropped (round 2)
+
+- PQ2_0 lane-group loop with per-lane pointer increments (no per-step 64-bit address math, ~20 of 210 loop instructions):
+  matvec ms per pass n=1 11.87 -> 12.43, n=3 18.18 -> 21.17 (more live 64-bit pointers). Reverted.
+- 5-column launch shapes (matvec ms per 5-token pass): 4 rows / 2 per EU 26.85 (kept), 3 / 2 28.09, 2 / 3 29.90, 2 / 2 31.34.
+- PTQ1_0 decode through a 256-entry LDS table (byte -> 5 digits; 4 ds_read_b64 + 11 v_perm per 4-byte word instead of
+  27 VALU): matvec 13.21 -> 14.12 ms per token (bank-conflicted random LDS reads; 128 VGPRs + 1 spill with the gate;
+  the unused table code alone cost 12.68 -> 13.21). Reverted.
+- PTQ1_0 repacked weight layout: not prototyped (see "Further improvements": loads are not the limit).
+- Padded-GQA indexing compiled into every tile FA instance: 512-token FA at 33K 42.15 -> 48.04 ms (+14%); now only in
+  the HIP ncols2 = 8 instances (42.15 again).
+- rms_norm writing q8_1 (our 19d64c7): no target; every trunk norm output feeds the fused Hadamard quantizer or the
+  BF16 alpha / beta mat-vecs. Only the MTP head quantizes normally.
+- ffn gate + up + SWIGLU fusion is refused in 24 of 64 layers at one token: ggml-alloc gives the GLU output the buffer of
+  the Hadamard output, which holds the fused quantizer's q8 rows, so `ggml_cuda_check_fusion_memory_ranges` fails
+  (correctly). Not fixed (see further improvements).
+
+### Open items (handed to the main session)
+
+| item | estimate | notes |
+|---|---|---|
+| PTQ1_0 mat-vec (decode bound) | <= 10% of its 12.6 ms | see below; a load-time repack to 2-bit codes = PQ2_0 format, no gain over the PQ2_0 model |
+| GCN J rebalance for the 1024-row K/V MMQ shapes | ~3 ms per pp512 pass (0.25%) | our 3c1147a / bafd5d3; the shapes run at 16 TOPS vs 24 elsewhere |
+| fewer Hadamard launches | ~0.45 ms per token (2.4%) | fold rms_norm (x weight) into the fused transform for the 80 inputs whose only consumer is the transform |
+| more multi-column tuning | 5-10% of a verify pass | 3-column mat-vec is 68% of a 3-token pass |
+
+## Further improvements
+
+Costs from rocprofv3 traces at `c82cd0052` (`tgprof.py` = 32-token generation, `ncprof.py` = N-token pass,
+`ppprof.py` = pp512 pass). GPU time per token at d0: PTQ1_0 18.7 ms, PQ2_0 17.8 ms; 3-token pass (PQ2_0) 24.8 ms;
+pp512 pass ~1230 ms.
+
+1. **PTQ1_0 mat-vec** - 12.6 ms per token (67% of PTQ1_0 generation). Kernel `mul_mat_vec_q_lg<PTQ1_0, 1, 1, 8, 1, 2>`
+   in mmvq.cu (whole 128-weight block per lane, PT layout, `ptq1_0_pt_block_dot`). Loop: 257 instructions per block
+   per lane, 13 loads (9 activation dwordx4, weights dwordx4 + dwordx2 + 2 ushort); ~162 are the base-3 decode
+   (per 4 weights and digit: 2 v_mul_u32_u24, 2 v_and, 1 v_perm). Counters: MemUnitBusy 61-69%, VALUBusy 54-63% on the
+   big shapes (output head 85 / 73): latency bound at 2 waves per EU (80-115 VGPRs). Gain estimate <= 10%.
+   Plan: cut decode VALU (e.g. derive digits t and t+2 from one multiply by 9, or v_pk_mul_lo_u16), then retry 3 waves per
+   EU; measure loop size with `kasm.sh` + `kloop.py` and time with `tgprof.py`. Risks: register pressure flips the
+   compiler into serialized loads (watch `s_waitcnt vmcnt` count in the loop). Dead ends: split block over 2 lanes
+   (memory-instruction bound, MemUnitBusy 82-90%), LDS digit table, R = 2 rows per lane (14.79 vs 13.41 ms).
+2. **Hadamard transform + quantize** - 257 launches per token: PTQ1_0 1.77 ms (9.5%), PQ2_0 1.40 ms (7.9%); 5.5-6.9 us
+   each against a ~4 us floor for a small kernel. Gain: ~0.45 ms (2.4%) by folding RMS_NORM + MUL(weight) into
+   `fwht_quantize_q8_1` (quantize.cu) for the inputs whose only consumer is the transform (FFN input of every layer, the
+   attention-layer attn_norm: 80 of the 129 rms_norm launches, 7 us each); each of the 5 blocks per row recomputes the
+   row sum of squares (20 KB read). Match in `ggml_cuda_try_fwht_q8` (ggml-cuda.cu). GDN layers' attn_norm also feeds the
+   BF16 alpha / beta mat-vecs, so it stays. Also possible: fold SWIGLU into the ffn_down transform input where gate+up
+   are not fused. Risks: the rms_norm reduction order (not bit-identical unless it copies rms_norm_f32<1024>'s order).
+3. **ffn gate + up + SWIGLU fusion in the other 24 layers** - 0.24 ms per token (1.3%). Plan: in `ggml_cuda_try_fwht_q8`
+   put the q8 rows in a pool block (the `out_aliases_in` path) when a later node's output aliases the transform output,
+   and let the GLU fusion's memory check ignore src1 when its q8 copy is elsewhere. Risk: coupling two fusions.
+4. **MTP verify mat-vec** - 3-column PQ2_0 kernel 16.8 of 24.8 ms per 3-token pass (68%), 42 us vs 27 us per call for
+   one column; ~48% VALU utilization (210 loop instructions for 3 rows x 3 columns x 32 weights). Gain 5-10% of the
+   step. Plan: share the activation chunk of a step through LDS across waves (our ysh kernel idea, 4 waves per block),
+   or 2 rows x 2 columns per lane split; sweep with `ncprof.py <gguf> 3` (temporary env knob for the shape table).
+5. **MTP draft passes** - the MTP head runs Q6_K / Q8_0 on the generic kernel (VEGA20 shape) plus the PQ2_0 output head
+   (1 column, ~470 us): ~1.5-2 ms per draft, 2 per step at draft 2 (~10% of a step). Plan: our fork's half-wave kernel
+   for Q6_K / Q8_0, rms_norm q8_1 (19d64c7) for the head's norms. Estimate 3-5% of MTP t/s.
+6. **Decode flash attention at depth** - after `c82cd0052` 232 us per layer at a 33K context (16 layers = 3.7 ms per
+   token, ~17% of a token at d32768): 136 MB of K/V per layer read once = ~590 GB/s. Gain ~1 ms per token at d32K
+   (~5%) by tuning the (256, 256, ncols 8) tile config row (nthreads, nbatch_fa, nbatch_K in fattn-tile.cuh, AMD table);
+   q8_0 KV halves the bytes (also the context win). Measure with `test-export-graph-ops -c 33280` + `test-backend-ops perf
+   --test-file ... -o FLASH_ATTN_EXT` (fine for kernels this long).
+7. **Prompt flash attention at depth** - 42.1 ms per layer per 512 tokens at a 33K context, 36% of a pp512 pass at d32768
+   (52% at d65536), ~10 TFLOPS of 26.9 fp16 peak. Plan: sweep the (256, 256, ncols 32) row; try ncols2 = 8 padded with
+   ncols1 = 4 (K/V tile shared by 6 heads instead of 2, 25% wasted columns). Estimate 10-20% of FA, 4-7% of pp @ d32K.
+8. **Prompt MMQ** - ~1030 ms per pp512 pass (84%), ~24 TOPS on all large shapes (45% of dp4a peak), y from VRAM via SGPRs
+   at J = 64. Further gains need an inner-loop restructure (our fork: ~41% issue ceiling, LDS-bound x reads).
+9. **BF16 alpha / beta GEMMs in prompts** - 96 rocBLAS calls, 34 ms per pp512 pass (2.7%), 0.7 TFLOPS. Plan: one GEMM
+   for the pair (n = 96 rows) or an MMF / tile kernel for 5120 x 48 x 512. Estimate ~2% pp.
+10. **Small kernels per token** - rms_norm 0.9 ms (129 x 7 us), GDN 0.9 ms (48 x 19 us), alpha / beta pair 0.56 ms,
+    host gap ~0.8 ms (tg128 53.3 t/s = 18.8 ms vs 17.8 ms GPU). Each <= 2-3%.
+
+### Lessons not written down elsewhere
+
+- DPP on gfx906 (verified with a probe kernel): `row_shl:n` (0x100+n) gives lane i the value of lane i+n, `row_shr:n`
+  (0x110+n) lane i-n, within 16-lane rows; quad_perm 0xB1 = xor 1, 0x4E = xor 2; row_half_mirror 0x141, row_mirror 0x140;
+  `ds_swizzle` 0x401F = xor 16 within 32 lanes. A DPP move inside a divergent branch (e.g. `cond ? dpp_a : dpp_b`, which
+  C evaluates lazily) reads 0 from the disabled lanes: compute every DPP value unconditionally, then select.
+- `test-backend-ops perf` adds ~140 us of host gaps per run on this fork: useless for kernels under ~1 ms, fine for
+  long ones. Use rocprofv3 traces (`tgprof.py`, `ncprof.py`, `ppprof.py`) for kernel times.
+- `llama-bench -p N` resets the recurrent state each repetition (`scale_f32`, ~0.8 ms per pass): not in real decoding.
+- A host+device constexpr helper must not depend on `__gfx906__`: the host pass does not define it (the MMQ tile size
+  helper guarded that way gave the host a too small shared-memory size and the kernel overflowed it).
+- HIP's `__byte_perm` is a generic C emulation; use `__builtin_amdgcn_perm(y, x, sel)` with the CUDA nibble selector
+  widened to bytes. `__vsub4(q, 0x01010101)` on digits 0..2 = `(q + 0x7F7F7F7F) ^ 0x80808080` (no carry).
+- Generic index math added to a shared kernel template can cost a lot on unrelated instances (padded GQA: +14% on the
+  prompt FA kernel); gate such changes at compile time.
+- With MTP (`n_rs_seq > 0`) every pass writes K conv-state snapshot copies: graph fusions that expect one copy never
+  match while serving. Check fusions with the MTP server, not only llama-bench.
+- `pgrep -f pattern` inside a wait loop matches the loop's own command line: use pid files or `pgrep -x`.
+- A llama-server under `rocprofv3` can hang after SIGTERM once the trace is written: `kill -9` it (it holds the GPU lock).
+- Bonsai on the raw CSV prompt of mtp-test emits EOS first: the Bonsai mtp-test sends `ignore_eos`.
+- `test-export-graph-ops -c N` exports the FA ops at context N: quick FA timing at depth without a prefill.
