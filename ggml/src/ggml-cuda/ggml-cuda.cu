@@ -3085,6 +3085,15 @@ static bool ggml_cuda_gdn_fusion_enabled() {
     return enabled;
 }
 
+// opt-in on NVIDIA; on by default on gfx906 (measured there: -1.3 ms per Bonsai 2 27B token), =0 turns it off
+static bool ggml_cuda_gdn_fusion_on(const int cc) {
+    static const bool env_set = getenv("GGML_CUDA_GDN_FUSION") != nullptr;
+    if (cc == GGML_CUDA_CC_VEGA20) {
+        return !env_set || ggml_cuda_gdn_fusion_enabled();
+    }
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_gdn_fusion_enabled();
+}
+
 struct ggml_cuda_gdn_conv_plan {
     int                 i_gather = -1;
     int                 i_cpy    = -1;
@@ -3330,7 +3339,7 @@ static bool ggml_cuda_gdn_conv_match(ggml_backend_cuda_context & ctx, const ggml
 
 // at the conv-state GET_ROWS: skip it when its CONCAT will run the fused chain
 static bool ggml_cuda_try_gdn_conv_gather_skip(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
-    if (!ggml_cuda_gdn_fusion_enabled() || !GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ctx.device].cc)) {
+    if (!ggml_cuda_gdn_fusion_on(ggml_cuda_info().devices[ctx.device].cc)) {
         return false;
     }
     const ggml_tensor * gr = cgraph->nodes[node_idx];
@@ -5135,8 +5144,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
-    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_gdn_fusion_enabled() &&
-            GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_gdn_fusion_on(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         if (const int n = ggml_cuda_try_mmvf_pair(*cuda_ctx, cgraph, i)) {
             return n;
         }
