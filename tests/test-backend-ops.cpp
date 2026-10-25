@@ -7277,6 +7277,43 @@ struct test_topk_moe : public test_case {
     }
 };
 
+// quantized mat-vec + residual add with a few columns (output projection of a short batch, e.g. a MTP verify)
+struct test_mul_mat_add_residual : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const int64_t m;
+    const int64_t n;
+
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ADD_RESIDUAL";
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, k, m, n);
+    }
+
+    test_mul_mat_add_residual(ggml_type type = GGML_TYPE_PQ2_0, int64_t k = 6144, int64_t m = 5120, int64_t n = 3)
+        : type(type), k(k), m(m), n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+        ggml_set_name(w, "w");
+        ggml_set_name(x, "x");
+        ggml_set_name(res, "res");
+        out = ggml_add(ctx, ggml_mul_mat(ctx, w, x), res);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -11263,6 +11300,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // fits is 393088 without a gate and 196480 with one; the next block over each falls back.
     for (int64_t k : {393088, 393216}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 64, 1, k, {1, 1}, {1, 1}));
+    }
+    for (ggml_type type : { GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0 }) {
+        for (int64_t n : { 1, 2, 3, 4, 5 }) {
+            test_cases.emplace_back(new test_mul_mat_add_residual(type, 6144, 5120, n));
+        }
     }
     for (int64_t k : {196480, 196608}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 64, k,

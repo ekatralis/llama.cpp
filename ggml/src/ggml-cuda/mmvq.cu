@@ -1325,7 +1325,7 @@ static __global__ void mul_mat_vec_q_lg(
             continue;
         }
         if (fusion.x_bias != nullptr) {
-            result += ((const float *) fusion.x_bias)[j*stride_col_dst + row];
+            result += ((const float *) fusion.x_bias)[j*fusion.x_bias_stride_col + row];
         }
         if constexpr (has_gate) {
             if (fusion.gate_bias != nullptr) {
@@ -1564,6 +1564,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         }
     }
 #endif // defined(GGML_USE_HIP)
+    // without ids, a bias with more than one column is only fused for the lane-group kernel (ggml_cuda_mmvq_fuses_bias_multi)
+    GGML_ASSERT(has_ids || ncols_dst == 1 || fusion.x_bias == nullptr);
 
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
@@ -1840,6 +1842,13 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+bool ggml_cuda_mmvq_fuses_bias_multi(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    const int64_t ncols = dst->ne[1];
+    return src0->type == GGML_TYPE_PQ2_0 && ncols >= 2 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] == ncols && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        ggml_cuda_gfx906_lg_layout(src0->type, (int) ncols, false, true);
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1870,7 +1879,8 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->x_bias && !fusion->gate && !fusion->gate_bias &&
+                    !fusion->x_scale && !fusion->gate_scale));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -1880,6 +1890,10 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
             fusion_local.x_bias = fusion->x_bias->data;
+            if (!ids && dst->ne[1] > 1) {
+                GGML_ASSERT(fusion->x_bias->nb[0] == sizeof(float) && ggml_are_same_shape(fusion->x_bias, dst));
+                fusion_local.x_bias_stride_col = fusion->x_bias->nb[1]/sizeof(float);
+            }
         }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));

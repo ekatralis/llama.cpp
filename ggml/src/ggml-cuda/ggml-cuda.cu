@@ -5091,6 +5091,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fused_node_count  = 2;
             break;
         }
+
+        // 2-4 columns (residual add after the MTP verify output projections), gfx906 lane-group kernel only
+        if (bias_op == GGML_OP_ADD && ids == nullptr && bias_tensor->type == GGML_TYPE_F32 &&
+                bias_tensor->nb[0] == sizeof(float) && ggml_are_same_shape(bias_tensor, mm_node) &&
+                ggml_is_contiguous(bias_node) && ggml_cuda_mmvq_fuses_bias_multi(src0, src1, mm_node)) {
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+            fused_mul_mat_vec = true;
+            fused_node_count  = 2;
+            break;
+        }
     }
 
     if (fused_mul_mat_vec) {

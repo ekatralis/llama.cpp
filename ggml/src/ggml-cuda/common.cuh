@@ -1815,6 +1815,7 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    uint32_t x_bias_stride_col = 0; // x_bias column stride for more than one column (gfx906 lane-group kernel only)
 };
 
 struct ggml_cuda_kernel_launch_params {
