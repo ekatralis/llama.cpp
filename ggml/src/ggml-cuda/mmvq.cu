@@ -1381,11 +1381,12 @@ static void mul_mat_vec_q_lg_launch(const void * vx, const void * vy, const ggml
         GGML_ASSERT(ncols_dst == 1);
         mul_mat_vec_q_lg_launch_cfg<type, 1, 1, 32, 2, 4, true>(LG_ARGS);
     } else {
+        // more columns: more rows per lane group amortize the activation loads, at fewer waves per EU
         switch (ncols_dst) {
             case 1: mul_mat_vec_q_lg_launch_cfg<type, 1, 1, 32, 2, 4, false>(LG_ARGS); break;
-            case 2: mul_mat_vec_q_lg_launch_cfg<type, 2, 1, 32, 2, 4, false>(LG_ARGS); break;
-            case 3: mul_mat_vec_q_lg_launch_cfg<type, 3, 1, 32, 2, 4, false>(LG_ARGS); break;
-            case 4: mul_mat_vec_q_lg_launch_cfg<type, 4, 1, 32, 2, 4, false>(LG_ARGS); break;
+            case 2: mul_mat_vec_q_lg_launch_cfg<type, 2, 1, 32, 4, 3, false>(LG_ARGS); break;
+            case 3: mul_mat_vec_q_lg_launch_cfg<type, 3, 1, 32, 3, 3, false>(LG_ARGS); break;
+            case 4: mul_mat_vec_q_lg_launch_cfg<type, 4, 1, 32, 4, 2, false>(LG_ARGS); break;
             default: GGML_ABORT("fatal error");
         }
     }
