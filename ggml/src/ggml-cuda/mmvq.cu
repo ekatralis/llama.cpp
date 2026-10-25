@@ -1900,6 +1900,9 @@ static __global__ void mul_mat_vec_q_hw(
                 continue;
             }
             if constexpr (ncols_dst > 1) {
+                if (fusion.x_bias != nullptr) {
+                    result += ((const float *) fusion.x_bias)[dst_off + j*fusion.x_bias_stride_col + row];
+                }
                 dst[dst_off + j*stride_col_dst + row] = result;
                 continue;
             }
@@ -2342,7 +2345,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         static const bool hw_disabled = getenv("GGML_CUDA_NO_MMVQ_HW") != nullptr;
         const bool hw_fusion_ok = fusion.shared_up == nullptr && fusion.x_scale == nullptr && fusion.gate_scale == nullptr &&
                                   (fusion.gate == nullptr || fusion.post_op == GGML_CUDA_MM_POST_NONE) &&
-                                  (ncols_dst == 1 || (fusion.gate == nullptr && fusion.x_bias == nullptr &&
+                                  (ncols_dst == 1 || (fusion.gate == nullptr &&
                                                       fusion.gate_bias == nullptr && fusion.post_op == GGML_CUDA_MM_POST_NONE));
         if (!hw_disabled && table_id == MMVQ_PARAMETERS_VEGA20 && !has_ids && hw_fusion_ok &&
                 (ncols_dst == 1 || (ncols_dst <= 4 && mmvq_hw_split<type>::available)) &&
@@ -2355,6 +2358,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
             return;
         }
     }
+    // without ids, a bias with more than one column is only fused when the hw kernel runs (ggml_cuda_mmvq_fuses_bias_multi)
+    GGML_ASSERT(has_ids || ncols_dst == 1 || fusion.x_bias == nullptr);
 
     if constexpr (mmvq_ysh_supported(type)) {
         const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
@@ -2669,6 +2674,34 @@ block_q8_1 * ggml_cuda_mmvq_q8_1_produce(ggml_backend_cuda_context & ctx, const 
     return (block_q8_1 *) cache.ptr;
 }
 
+// types with a split load / math path (mmvq_hw_split<type>::available)
+static bool mmvq_hw_split_available(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_cuda_mmvq_fuses_bias_multi(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const bool hw_disabled = getenv("GGML_CUDA_NO_MMVQ_HW") != nullptr;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int64_t ncols = dst->ne[1];
+    return !hw_disabled && get_device_table_id(cc) == MMVQ_PARAMETERS_VEGA20 && ncols >= 2 && ncols <= 4 &&
+        dst->ne[2] == 1 && dst->ne[3] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] == ncols &&
+        mmvq_hw_split_available(src0->type) && mmvq_hw_use(src0->type, src0->ne[1], ncols, false);
+}
+
 // q8_1 copy of src1, reused if the previous MMVQ call of this graph had the same src1
 static char * mmvq_src1_q8_1(ggml_backend_cuda_context & ctx, const ggml_type type_x, const ggml_tensor * src1,
         ggml_cuda_pool_alloc<char> & alloc) {
@@ -2750,7 +2783,8 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->x_bias && !fusion->gate && !fusion->gate_bias &&
+                    !fusion->x_scale && !fusion->shared_up && fusion->post_op == GGML_CUDA_MM_POST_NONE));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -2777,6 +2811,10 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
             fusion_local.x_bias = fusion->x_bias->data;
+            if (!ids && dst->ne[1] > 1) {
+                GGML_ASSERT(fusion->x_bias->nb[0] == sizeof(float) && ggml_are_same_shape(fusion->x_bias, dst));
+                fusion_local.x_bias_stride_col = fusion->x_bias->nb[1]/sizeof(float);
+            }
         }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));

@@ -4320,6 +4320,43 @@ struct test_unary_mul : public test_case {
     }
 };
 
+// quantized mat-vec + residual add with a few columns (output projection of a short batch, e.g. a MTP verify)
+struct test_mul_mat_add_residual : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const int64_t m;
+    const int64_t n;
+
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ADD_RESIDUAL";
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, k, m, n);
+    }
+
+    test_mul_mat_add_residual(ggml_type type = GGML_TYPE_IQ4_XS, int64_t k = 6144, int64_t m = 5120, int64_t n = 3)
+        : type(type), k(k), m(m), n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+        ggml_set_name(w, "w");
+        ggml_set_name(x, "x");
+        ggml_set_name(res, "res");
+        out = ggml_add(ctx, ggml_mul_mat(ctx, w, x), res);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // rms_norm * weight feeding a quantized mat-vec (some backends write the mat-vec's quantized input in the norm)
 struct test_rms_norm_mul_mat : public test_case {
     const ggml_type type;
@@ -10163,6 +10200,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (int64_t n_tokens : { 1, 2, 3, 4, 5 }) {
         test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q4_0, 5120, 256, n_tokens));
+    }
+    for (ggml_type type : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K }) {
+        for (int64_t n : { 1, 2, 3, 4, 5 }) {
+            test_cases.emplace_back(new test_mul_mat_add_residual(type, 6144, 5120, n));
+        }
     }
     test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_IQ4_XS, 2048, 512, 1));
     for (int64_t n_t : { 1, 3, 4, 9 }) {

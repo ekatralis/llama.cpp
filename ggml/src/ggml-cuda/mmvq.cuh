@@ -15,6 +15,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// gfx906: a MUL_MAT with 2-4 columns runs the hw kernel, which also adds a bias of the dst shape (x_bias)
+bool ggml_cuda_mmvq_fuses_bias_multi(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
 // gated delta net beta / alpha mat-vecs with their epilogues in one launch (outputs contiguous, nrows x ncols)
 bool ggml_cuda_mul_mat_vec_q_gdn_pair_supported(const ggml_tensor * w_b, const ggml_tensor * w_a, const ggml_tensor * src1);
 void ggml_cuda_mul_mat_vec_q_gdn_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * w_b, const ggml_tensor * w_a,

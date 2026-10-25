@@ -1628,6 +1628,7 @@ struct ggml_cuda_mm_fusion_args_device {
     uint32_t shared_stride_col_dst = 0;
     int post_op = GGML_CUDA_MM_POST_NONE;
     const float * post_mul = nullptr;
+    uint32_t x_bias_stride_col = 0;   // x_bias column stride for more than one column (gfx906 hw kernel only)
 };
 
 struct ggml_cuda_kernel_launch_params {
