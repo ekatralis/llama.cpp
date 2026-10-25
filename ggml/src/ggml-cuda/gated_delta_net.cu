@@ -16,6 +16,12 @@ static constexpr __host__ __device__ int gdn_cols_per_warp(int arch, int S_v, bo
 #endif
 }
 
+// gfx906: split a wave into lane segments, one state column each (4-lane reductions per token). 1 elsewhere.
+// num_warps * segments must not exceed S_v (one block covers that many columns).
+static constexpr __host__ __device__ int gdn_lane_segments(bool gfx906, int S_v) {
+    return gfx906 && S_v >= 64 ? 16 : 1;
+}
+
 static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n;
          i += (int64_t) blockDim.x*gridDim.x) {
@@ -88,7 +94,14 @@ gated_delta_net_cuda(const float * q,
 #else
     constexpr int cols_per_warp = 1; // host pass only; never executed
 #endif
-    const int      col      = (blockIdx.z * blockDim.y + threadIdx.y) * cols_per_warp;
+#if defined(__gfx906__)
+    constexpr int segs = gdn_lane_segments(true, S_v);
+#else
+    constexpr int segs = gdn_lane_segments(false, S_v);
+#endif
+    constexpr int lanes_per_col = (ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) / segs;
+    const int      lane_in_col = lane % lanes_per_col;
+    const int      col      = ((blockIdx.z * blockDim.y + threadIdx.y) * segs + lane / lanes_per_col) * cols_per_warp;
 
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
@@ -111,7 +124,7 @@ gated_delta_net_cuda(const float * q,
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
-    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+    constexpr int rows_per_lane = (S_v + lanes_per_col - 1) / lanes_per_col;
     float         s_shard[cols_per_warp][rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
@@ -119,7 +132,7 @@ gated_delta_net_cuda(const float * q,
     for (int c = 0; c < cols_per_warp; ++c) {
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * warp_size + lane;
+            const int i = r * lanes_per_col + lane_in_col;
             s_shard[c][r] = curr_state[(col + c) * S_v + i];
         }
     }
@@ -143,7 +156,7 @@ gated_delta_net_cuda(const float * q,
         float q_reg[rows_per_lane];
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * warp_size + lane;
+            const int i = r * lanes_per_col + lane_in_col;
             k_reg[r] = k_t[i];
             q_reg[r] = q_t[i];
         }
@@ -165,7 +178,7 @@ gated_delta_net_cuda(const float * q,
                 for (int r = 0; r < rows_per_lane; r++) {
                     kv_shard += s_shard[c][r] * k_reg[r];
                 }
-                float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+                float kv_col = warp_reduce_sum<lanes_per_col>(kv_shard);
 
                 float delta_col = (v_t[col + c] - g_val * kv_col) * beta_val;
 
@@ -176,9 +189,9 @@ gated_delta_net_cuda(const float * q,
                     attn_partial += s_shard[c][r] * q_reg[r];
                 }
 
-                float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+                float attn_col = warp_reduce_sum<lanes_per_col>(attn_partial);
 
-                if (lane == 0) {
+                if (lane_in_col == 0) {
                     attn_data[col + c] = attn_col * scale;
                 }
             }
@@ -187,11 +200,11 @@ gated_delta_net_cuda(const float * q,
             float kv_shard = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
+                const int i = r * lanes_per_col + lane_in_col;
                 kv_shard += expf(g_t[i]) * s_shard[0][r] * k_reg[r];
             }
 
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+            float kv_col = warp_reduce_sum<lanes_per_col>(kv_shard);
 
             // delta[col] = (v[col] - kv[col]) * beta
             float delta_col = (v_t[col] - kv_col) * beta_val;
@@ -201,14 +214,14 @@ gated_delta_net_cuda(const float * q,
             float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
+                const int i = r * lanes_per_col + lane_in_col;
                 s_shard[0][r]  = expf(g_t[i]) * s_shard[0][r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[0][r] * q_reg[r];
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+            float attn_col = warp_reduce_sum<lanes_per_col>(attn_partial);
 
-            if (lane == 0) {
+            if (lane_in_col == 0) {
                 attn_data[col] = attn_col * scale;
             }
         }
@@ -225,7 +238,7 @@ gated_delta_net_cuda(const float * q,
                 for (int c = 0; c < cols_per_warp; ++c) {
 #pragma unroll
                     for (int r = 0; r < rows_per_lane; r++) {
-                        const int i = r * warp_size + lane;
+                        const int i = r * lanes_per_col + lane_in_col;
                         curr_state[(col + c) * S_v + i] = s_shard[c][r];
                     }
                 }
@@ -239,7 +252,7 @@ gated_delta_net_cuda(const float * q,
         for (int c = 0; c < cols_per_warp; ++c) {
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
+                const int i = r * lanes_per_col + lane_in_col;
                 state[(col + c) * S_v + i] = s_shard[c][r];
             }
         }
@@ -264,7 +277,8 @@ static void launch_gated_delta_net(
     const int num_warps = 4;
     // Same predicate as the kernel, fed the arch compiled for this cc.
     const int cols_per_warp = GGML_CUDA_CC_IS_NVIDIA(cc) ? gdn_cols_per_warp(ggml_cuda_highest_compiled_arch(cc), S_v, KDA) : 1;
-    dim3      grid_dims(H, n_seqs, (S_v + num_warps * cols_per_warp - 1) / (num_warps * cols_per_warp));
+    const int segs          = gdn_lane_segments(cc == GGML_CUDA_CC_VEGA20, S_v);
+    dim3      grid_dims(H, n_seqs, (S_v + num_warps * cols_per_warp * segs - 1) / (num_warps * cols_per_warp * segs));
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
