@@ -2893,7 +2893,8 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     static const bool pq2_enabled = getenv("GGML_CUDA_FWHT_FUSION_PQ2") != nullptr &&
                                     atoi(getenv("GGML_CUDA_FWHT_FUSION_PQ2")) != 0;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
+    const bool gfx906 = cc == GGML_CUDA_CC_VEGA20; // one-column mat-vecs on the PT / PQ2 layouts (mmvq.cu)
+    if ((!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) && !gfx906) {
         return 0; // the PTQ1_0 mmvq predicate below is only meaningful there
     }
 
@@ -2997,7 +2998,7 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
                 continue;
             }
             const ggml_type ct = t->src[0] ? t->src[0]->type : GGML_TYPE_COUNT;
-            const bool type_ok = ct == GGML_TYPE_PTQ1_0 || (pq2_enabled && ct == GGML_TYPE_PQ2_0);
+            const bool type_ok = ct == GGML_TYPE_PTQ1_0 || ((pq2_enabled || gfx906) && ct == GGML_TYPE_PQ2_0);
             if (t->op != GGML_OP_MUL_MAT || s != 1 || !type_ok || (wtype != GGML_TYPE_COUNT && ct != wtype) ||
                     ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
                     t->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
@@ -3032,7 +3033,8 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
 
     // same (type, ncols, ids) -> layout and padding as ggml_cuda_mul_mat_vec_q
     layout     = ggml_cuda_q8_1_layout_host(wtype, (int) ncols, false);
-    if (layout != GGML_CUDA_Q8_1_AOS && layout != GGML_CUDA_Q8_1_PT && layout != GGML_CUDA_Q8_1_SOA_ISUM) {
+    if (layout != GGML_CUDA_Q8_1_AOS && layout != GGML_CUDA_Q8_1_PT && layout != GGML_CUDA_Q8_1_SOA_ISUM &&
+            !(gfx906 && layout == GGML_CUDA_Q8_1_PQ2)) {
         return 0; // e.g. the Ada PQ2_0 multi-column layout, which the fused quantizer does not write
     }
     ne0_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
