@@ -591,10 +591,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = true;
             need_f16_V = true;
             break;
-        case BEST_FATTN_KERNEL_TILE:
-            need_f16_K = true;
-            need_f16_V = true;
-            break;
+        case BEST_FATTN_KERNEL_TILE: {
+            // gfx906 q8_0 K/V read directly by the tile kernel: no f16 copy of the cache
+            const bool q8_0_direct = ggml_cuda_fattn_tile_q8_0_direct(dst, ggml_cuda_info().devices[device].cc);
+            need_f16_K = !q8_0_direct;
+            need_f16_V = !q8_0_direct;
+        } break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
