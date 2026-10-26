@@ -850,12 +850,24 @@ static __global__ void flash_attn_tile(
 
     const int col_Q_0 = blockIdx.x * ncols1; // Index of the first Q column for this CUDA block to work on.
 
-    const int sequence = blockIdx.z / (ne02/ncols2);
-    const int head0 = blockIdx.z*ncols2 - sequence*ne02; // == blockIdx.z % (ne02/ncols2)
-    const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+    // z = (sequence, K/V head, tile of ncols2 Q heads of that K/V head); the last tile may be partial when ncols2 does
+    // not divide the GQA ratio (its columns past the group are padding: not loaded, not written)
+    // Only the HIP ncols2 == 8 instances take partial tiles (gfx906 dispatch below); the others keep the plain indexing.
+#if defined(GGML_USE_HIP)
+    constexpr bool gqa_pad = ncols2 == 8;
+#else
+    constexpr bool gqa_pad = false;
+#endif // defined(GGML_USE_HIP)
+    const int gqa_ratio    = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+    const int ntiles_z_gqa = gqa_pad ? (gqa_ratio + ncols2 - 1) / ncols2 : gqa_ratio / ncols2;
+    const int sequence     = blockIdx.z / (ntiles_z_gqa*ne12);
+    const int z_rem        = blockIdx.z - sequence*ntiles_z_gqa*ne12;
+    const int z_KV         = gqa_pad ? z_rem / ntiles_z_gqa : (z_rem*ncols2) / gqa_ratio;
+    const int head0        = gqa_pad ? z_KV*gqa_ratio + (z_rem - z_KV*ntiles_z_gqa)*ncols2 : z_rem*ncols2;
+    const int n_valid_c    = gqa_pad ? min(ncols2, gqa_ratio - (head0 - z_KV*gqa_ratio)) : ncols2;
     const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
-    const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
-    const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
+    const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*z_KV);
+    const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*z_KV); // K and V have same shape
 
     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
 
@@ -916,9 +928,11 @@ static __global__ void flash_attn_tile(
         for (int i0 = 0; i0 < DKQp; i0 += np*warp_size*cpy_ne_D) {
             if (i0 + np*warp_size*cpy_ne_D <= DKQ || i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D < DKQ) {
                 __align__(16) float tmp_f[cpy_ne_D] = {0.0f};
-                ggml_cuda_memcpy_1<sizeof(tmp_f)>
-                    (tmp_f, &Q_f[c*(nb02/sizeof(float)) + fastmodulo(col_Q_0 + j, ne01)*(nb01/sizeof(float))
-                                 + i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D]);
+                if (!gqa_pad || c < n_valid_c) {
+                    ggml_cuda_memcpy_1<sizeof(tmp_f)>
+                        (tmp_f, &Q_f[c*(nb02/sizeof(float)) + fastmodulo(col_Q_0 + j, ne01)*(nb01/sizeof(float))
+                                     + i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D]);
+                }
 
 #pragma unroll
                 for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
@@ -1054,7 +1068,7 @@ static __global__ void flash_attn_tile(
 #pragma unroll
         for (int jc0 = 0; jc0 < cpw; ++jc0) {
             const int jc = jc0 + (threadIdx.y/np)*cpw;
-            const float sink = ((const float *) sinks)[head0 + jc % ncols2];
+            const float sink = ((const float *) sinks)[head0 + min(jc % ncols2, n_valid_c - 1)];
 
             float KQ_max_new_j = fmaxf(KQ_max[jc0], sink);
             const float KQ_max_scale = expf(KQ_max[jc0] - KQ_max_new_j);
@@ -1089,6 +1103,9 @@ static __global__ void flash_attn_tile(
 
         if (ncols1 > 1 && col_Q_0 + j >= int(ne01.z)) {
             return;
+        }
+        if (gqa_pad && c >= n_valid_c) {
+            continue; // padding column of a partial GQA tile
         }
 
         const float scale = gridDim.y == 1 ? 1.0f/KQ_sum[jc0] : 1.0f;
@@ -1296,6 +1313,18 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
+#if defined(GGML_USE_HIP)
+        // gfx906, few tokens (decode, MTP verify): one tile of 8 Q heads per K/V head when 4 does not divide the GQA
+        // ratio (e.g. 6), so each K/V head is read once instead of gqa_ratio/2 times; the padding columns are skipped
+        if constexpr (DKQ == 256 && DV == 256) {
+            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            if (cc == GGML_CUDA_CC_VEGA20 && use_gqa_opt && gqa_ratio % 4 != 0 && gqa_ratio > 4 && gqa_ratio < 8 &&
+                    Q->ne[1] <= 4) {
+                launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
+                return;
+            }
+        }
+#endif // defined(GGML_USE_HIP)
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
             return;
