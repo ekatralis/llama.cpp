@@ -249,3 +249,19 @@ Decisions and changes against the plan above:
 - **MTP check (1c):** the MTP verify step runs 3-token kernels, so its logits are not bit-identical to single-token
   decoding; greedy text can differ after a near-tie. Reported as identical prompts and first differing character, like
   the fork-vs-stock comparison.
+
+### Change 2026-10-26: thinking on everywhere, medium effort; xhigh comparison for coding and maths
+
+Owner's decision. Both chat templates take `reasoning_effort` (`xhigh` = template default, adds "Please think
+carefully through the task, validate key assumptions, ..." to the system prompt; `medium` = no instruction; `low`).
+The first pilot ran with the template default (xhigh) where thinking was on; that pilot is kept as
+`results/pilot-v1-xhigh`.
+
+- All benchmarks: thinking on, `reasoning_effort=medium` (sent as a chat template kwarg per request).
+- Thinking budgets: HumanEval+ / MBPP+ / MATH-500 8k, LiveCodeBench 16k, AIME 24k, IFEval / MMLU-Pro / GSM8K /
+  long-context retrieval / LongBench v2 4k. `max_tokens` = budget + 0.5-4k for the answer.
+- MMLU-Pro cut to 700 questions (50 per subject, same seed) to pay for the thinking.
+- Comparison runs at `reasoning_effort=xhigh`, same seeds and budgets: HumanEval+, MBPP+, LiveCodeBench,
+  MATH-500, GSM8K, AIME. Results in `results/<bench>-xhigh/`. Run after all medium runs.
+- Long-context servers get context = length + 6144 so the thinking fits.
+- New pilot at medium for every benchmark (`results/pilot`), plus MATH-500 / GSM8K at xhigh.
