@@ -476,3 +476,18 @@ pp512 pass ~1230 ms.
 - A llama-server under `rocprofv3` can hang after SIGTERM once the trace is written: `kill -9` it (it holds the GPU lock).
 - Bonsai on the raw CSV prompt of mtp-test emits EOS first: the Bonsai mtp-test sends `ignore_eos`.
 - `test-export-graph-ops -c N` exports the FA ops at context N: quick FA timing at depth without a prefill.
+
+## Round 3: q8_0 K/V attention (2026-10-26, main session)
+
+Done in the main fork first (gfx906-qwen38 c47e1c3, d8c1986, see its README "Long-context attention"), then ported:
+
+- `6d5bebd31`: decode with a quantized K/V cache used the vec kernel (one block per Q head: each K/V head read 6
+  times). On gfx906 with GQA it now uses the tile kernel. PQ2_0 q8_0 K/V: tg128 48.89 -> 52.80, @ d32768 28.11 -> 38.84.
+- `310544893`: the tile kernel reads q8_0 K/V directly (no f16 copy of the cache, none allocated).
+  PQ2_0 q8_0 K/V: tg128 @ d32768 38.84 -> 45.62, pp512 @ d32768 264.0 -> 252.3 (prompt FA ~15% slower than f16 tiles),
+  tg128 52.0 (noise vs 52.8). `GGML_CUDA_NO_FA_Q8_0_TILE=1` restores the copy path.
+
+Max context with q8_0 K/V (same method as above): PQ2_0 233,472 -> 253,952 (262,144 does not fit); Qwen3.8 Q3_K_XL on
+the main fork 98,304 -> 106,496. PTQ1_0 was already at the full 262,144. Not re-measured: PQ2_0 + MTP.
+
+KLD, direct vs copy path (PQ2_0, q8_0 K/V): ubatch 1 at the noise floor, ubatch 512 0.000124 (fp16 summation).
