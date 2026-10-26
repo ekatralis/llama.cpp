@@ -558,7 +558,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            // gfx906 with GQA: the tile kernel reads each K/V head once (from an f16 copy), the vec kernel once per Q head
+            if (Q->ne[1] <= 2 && !(cc == GGML_CUDA_CC_VEGA20 && gqa_opt_applies)) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
