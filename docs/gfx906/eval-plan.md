@@ -52,8 +52,21 @@ Two questions:
   - LongBench v2 (THUDM dataset; small own client).
   - Long-context retrieval: our own RULER-style generator (stdlib Python, in `/opt/gfx906-tools/eval/`), so every
     prompt and score is easy to audit.
-- **Model-written code execution (EvalPlus, LiveCodeBench)** runs as an unprivileged user with no network
-  (`unshare -n`), CPU / memory / time limits, in a scratch directory.
+- **Model-written code execution (EvalPlus, LiveCodeBench)** runs through `/opt/gfx906-tools/eval/sandbox.sh`
+  (the whole evaluation step, not only single tests):
+  - The container is an apptainer `--fakeroot` instance: container root is host uid 1008 (the user's account), and
+    container uids 1-65536 map to the host subordinate range starting at 624288. So container uid 1000 is host uid
+    625287, which owns nothing on the host.
+  - `sandbox.sh <workdir> <timeout> <cmd>`: new network namespace (loopback only, so llama-server and the internet
+    are unreachable) and a private mount namespace in which `/tmp` (the host's `/tmp` is bind-mounted here), `/opt`,
+    `/home`, `/root` and `/data` are replaced by empty tmpfs; only the work dir (under `/opt/eval/sbx/`) is visible,
+    at `/run/sbxw`.
+  - Then `setpriv` to uid/gid 1000, no capabilities (inheritable and bounding sets cleared), `no_new_privs`, and
+    `prlimit` limits (4 GiB address space, 256 processes, 256 MiB file size, 256 open files) plus a wall-clock timeout.
+  - Tested 2026-10-26: no network (`ENETUNREACH`), models and repos invisible, `/dev/kfd` and `/etc/shadow`
+    unreadable, `/usr` read-only, a 6 GiB allocation fails, an infinite loop is killed at the timeout.
+  - Remaining risk: a kernel exploit from inside the namespaces. Acceptable for benchmark code that is not
+    adversarial.
 - **Pilot:** 10 questions of every benchmark on `qwen-q3`, to check that answer extraction and scoring work, and to
   measure the real tokens per answer. The sample sizes below are then scaled to the time budget (the pilot numbers and
   any changes get written into this file before the full run).
