@@ -511,6 +511,66 @@ Already tried for prompt (see the 2026-10-23 log): chunked (WY) gated delta net 
 the recurrent kernel without matrix units), double-buffered y, preloading y for all columns
 (spills), IQ3_S sign helper in the loader (noise), 256-thread / occupancy-1 MMQ configs.
 
+Update 2026-10-26: option 2 (attention at depth) was looked at, see the next section. The prompt
+FA config sweep found nothing better than the current config.
+
+### Long-context attention (2026-10-26, 595e20a, c47e1c3, d8c1986)
+
+Qwen3.8 27B has 24 Q heads on 4 K/V heads (GQA 6), head size 256, 16 full-attention layers.
+Decode attention at depth was much slower than its data size needs, worst with a q8_0 K/V cache,
+which is what large contexts in 16 GB need.
+
+- 595e20a (port of the Bonsai branch's c82cd0052): the tile kernel took 2 Q heads per block (the
+  largest power of two dividing 6), so each K/V head was read 3 times per step. On gfx906, for 1-4
+  tokens and GQA 5-7, one tile of 8 Q heads per K/V head (padding columns skipped).
+  Decode FA at depth 32768: 6.90 -> 3.45 ms per token. tg128 @ d8192 35.58 -> 36.46,
+  @ d32768 30.29 -> 33.59 t/s (f16 K/V).
+- c47e1c3: with quantized K/V and 1-2 tokens the dispatcher picked the vec kernel, one block per
+  Q head, so each K/V head was read 6 times (1013 us per layer at depth 32768, ~70 GB/s). On
+  gfx906 with GQA it now takes the tile kernel (f16 copy of K/V + one read per K/V head).
+  q8_0 K/V: tg128 @ d32768 22.69 -> 28.85 t/s.
+- d8c1986: the f16 copy then cost more than the attention (4.43 of 7.9 ms per token at 32768) and
+  ~320 MiB of the compute buffer at a 98k context. The tile kernel now dequantizes q8_0 straight
+  into its shared-memory tile (`flash_attn_tile_load_tile_q8_0`, `kv_q8_0` template flag):
+  - one 34 B block per thread; dword loads plus a byte shift (`v_alignbyte`) since blocks are only
+    2-byte aligned; int8 -> fp16 exactly as (0x6400 | (q + 128)) - 1152 with `v_perm`, then one
+    fp16 multiply by d, the same values as the f16 conversion.
+  - First version spilled 81 VGPRs (scratch 296 B) and was only 1103 -> 556 us. Occupancy 1
+    removed the spills (213 VGPRs, 324 us); partial unroll (4) of the KQ and VKQ inner loops at
+    occupancy 2 gave 56 VGPRs and 226 us (f16 tiles: 219 us). The same unroll on the HIP 8-head
+    f16 instances removed their 5-VGPR spill: 219 -> 210 us, tg128 +0.3.
+  - Prompt instances (2 Q heads per tile) too, so no f16 copy is allocated at all; they need the
+    partial unroll as well (73 VGPR spill, 2.4x slower without it) and are still ~15% slower than
+    f16 tiles (46.1 vs 39.7 ms per layer at depth 32768, 512 tokens).
+  - `ggml_cuda_fattn_tile_q8_0_direct()` is used by both the dispatch and the FA buffer size.
+    `GGML_CUDA_NO_FA_Q8_0_TILE=1` restores the f16 copy path.
+
+| Qwen3.8 27B Q3_K_XL, t/s | f16 K/V before | f16 K/V now | q8_0 K/V before | q8_0 K/V now |
+|---|---:|---:|---:|---:|
+| tg128 | 38.35 | 38.62 | 36.52 | 38.05 |
+| tg128 @ d8192 | 35.58 | 36.80 | - | 36.41 |
+| tg128 @ d32768 | 30.29 | 33.59 | 22.69 | 33.25 |
+| pp512 @ d32768 | - | 253.2 | 255.8 | 245.0 |
+| max llama-server context (16 GB, 4096 steps) | 57344 | - | 98304 | 106496 |
+
+"before" = aab860d (q8_0: vec kernel for decode, f16 copy for prompt). MTP draft 2 / 3 at short
+context unchanged (61.1 / 56.8, 57.8 / 52.4 with f16 K/V; q8_0 K/V 60.6 / 54.1).
+
+Output: decode (ubatch 1 / 3) with direct q8_0 equals the f16 copy path (KLD at the noise floor).
+Prompt (ubatch 512) differs from it by KLD 0.0006 (fp16 summation, the two instances are compiled
+differently; FLASH_ATTN_EXT errors vs CPU are the same size for both), vs stock with f16 K/V:
+copy path 0.000748, direct 0.000807 (both mostly the q8_0 cache itself). f16 K/V decode after
+595e20a: KLD vs stock 0.000326 / 0.000322 at ubatch 1 / 3 (was 0.000298 / 0.000301).
+
+Tested and not kept: prompt FA configs for 32 columns (512 threads, occupancy 1, nbatch_fa 64,
+nbatch_K 64 / 256): none beat 256 / 2 / 32 / 128 at 512 tokens. 512 threads / occupancy 1 /
+64 / 64 made the 3-token verify 15% faster (507 -> 433 us at depth 32768) but prompts 1% slower;
+the row is shared, so splitting it needs a dispatch change (~2-3% of MTP t/s at 32k, not done).
+
+Open: the 3-token MTP verify FA costs 2.3x one token at depth (477 vs 210 us at 32768) although it
+reads the same K/V once; prompt FA with q8_0 is 15% slower than f16 (a loader that stages raw
+q8_0 rows through LDS with 16-byte loads might close it).
+
 ### Output reference points (vs stock upstream f5027fb)
 
 Measured with `kld-check.sh` (KL divergence of the logits vs stock; ubatch 512 = prompt kernels,
