@@ -265,3 +265,32 @@ The first pilot ran with the template default (xhigh) where thinking was on; tha
   MATH-500, GSM8K, AIME. Results in `results/<bench>-xhigh/`. Run after all medium runs.
 - Long-context servers get context = length + 6144 so the thinking fits.
 - New pilot at medium for every benchmark (`results/pilot`), plus MATH-500 / GSM8K at xhigh.
+
+### Pilot results 2026-10-26 (`qwen-q3`, medium effort, 10 questions per benchmark)
+
+| benchmark | n | score | mean tokens | budget hit | time | full-size estimate |
+|---|---|---|---|---|---|---|
+| HumanEval+ | 10 | 10/10 plus | 638 | 0 | 1.7 min | 164: ~0.5 h |
+| MBPP+ | 10 | 9/10 plus, 10/10 base | 591 | 0 | 1.4 min | 378: ~0.9 h |
+| IFEval | 10 | 10/10 strict | 1856 | 0 | 4.8 min | 541: ~4.3 h |
+| LiveCodeBench | 10 | 4/10 | 15799 | 7 | 39.2 min | 100: ~6.5 h |
+| MMLU-Pro | 14 | 14/14 | 1104 | 0 | 4.2 min | 700: ~3.5 h |
+| MATH-500 | 10 | 10/10 | 1432 | 0 | 3.6 min | 200: ~1.2 h |
+| GSM8K | 10 | 10/10 | 409 | 0 | 1.2 min | 250: ~0.5 h |
+| AIME 2025 | 3 | 3/3 | 2934 | 0 | 3.4 min | 30: ~0.6 h |
+| LongBench v2 | 5 | 2/5 | 1838 | 0 | 7.8 min | 93: ~2.4 h |
+| retrieval 8k | 18 | 18/18 | 278 | 0 | 3.3 min | |
+
+xhigh pilot: MATH-500 10/10 at 1805 tokens (+26%), GSM8K 10/10 at 502 (+23%). The first pilot (template default =
+xhigh): HumanEval+ 10/10 at 1431 tokens, MBPP+ 10/10 base / 9/10 plus, LiveCodeBench 4/10 at 15565 tokens with 8 of 10
+at the 16k budget.
+
+- Scores at n = 10 are saturated and say nothing yet; the pilot checked extraction, scoring and cost.
+- Medium totals: ~20 h of short-form benchmarks for `qwen-q3`, plus long context; ~2.8 days for the three models.
+- LiveCodeBench hits the 16k thinking budget on 7-8 of 10 problems at both efforts, so the xhigh LiveCodeBench run would
+  mostly repeat the medium one (~6.5 h per model). Open question to the owner: drop it, or run it with a larger budget.
+- Fixes found by the pilot: MBPP+ expected outputs (790 MB on disk, over 4 GB in memory) are now computed once in the
+  sandbox from the reference solutions only (`evalplus_gt.sh`, stored in `/opt/eval/evalplus-gt`) and the evalplus
+  scoring sandbox gets 16 GB address space / 8 GB file size (`SBX_AS`, `SBX_FSIZE`); `run_longctx.sh` and
+  `phase1-greedy.sh` dropped their first argument to `bash -c` (it becomes `$0`).
+- Full medium run started 2026-10-26 17:22 (`run_all.sh '^[a-z0-9]+:'`, i.e. without the xhigh jobs).
