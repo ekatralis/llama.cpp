@@ -287,10 +287,16 @@ at the 16k budget.
 
 - Scores at n = 10 are saturated and say nothing yet; the pilot checked extraction, scoring and cost.
 - Medium totals: ~20 h of short-form benchmarks for `qwen-q3`, plus long context; ~2.8 days for the three models.
-- LiveCodeBench hits the 16k thinking budget on 7-8 of 10 problems at both efforts, so the xhigh LiveCodeBench run would
-  mostly repeat the medium one (~6.5 h per model). Open question to the owner: drop it, or run it with a larger budget.
+- LiveCodeBench hits the 16k thinking budget on 7-8 of 10 problems at both efforts (the pilot's 10 are 8 hard; the full
+  100 are 23 easy / 31 medium / 46 hard), so an xhigh run at 16k would mostly repeat the medium one. Owner's choice:
+  the xhigh LiveCodeBench run uses a 32k thinking budget instead (`run_bench.sh lcb <model> 0 xhigh32k`, results in
+  `results/lcb-xhigh32k/`, `max_tokens` 36864, 40k per slot: 2 slots on `qwen-q3`, 4 on Bonsai). It changes effort and
+  budget together, so it answers "what do xhigh and more thinking buy", not either one alone. Estimated ~25-30 h for
+  the three models.
 - Fixes found by the pilot: MBPP+ expected outputs (790 MB on disk, over 4 GB in memory) are now computed once in the
   sandbox from the reference solutions only (`evalplus_gt.sh`, stored in `/opt/eval/evalplus-gt`) and the evalplus
   scoring sandbox gets 16 GB address space / 8 GB file size (`SBX_AS`, `SBX_FSIZE`); `run_longctx.sh` and
   `phase1-greedy.sh` dropped their first argument to `bash -c` (it becomes `$0`).
 - Full medium run started 2026-10-26 17:22 (`run_all.sh '^[a-z0-9]+:'`, i.e. without the xhigh jobs).
+- xhigh runs queued behind it (`run_xhigh.sh <run_all pid>`): HumanEval+ / MBPP+ / MATH-500 / GSM8K / AIME at xhigh with
+  the medium budgets, then LiveCodeBench at xhigh / 32k.
