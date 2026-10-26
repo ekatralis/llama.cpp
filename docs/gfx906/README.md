@@ -30,6 +30,10 @@ All installed with `apt-get install` as root on 2026-10-23.
 | `python3-numpy`, `python3-yaml` | needed by `gguf-py` to inspect model files |
 | `jq` | JSON parsing for the Claude Code status line script (not used by the fork) |
 | `gdb` (2026-10-24) | stack sampling of llama-server (perf is blocked in this container) |
+| `python3.12-venv`, `python3-pip` (2026-10-26) | Python venv `/opt/eval/venv` for the model evaluation (`docs/gfx906/eval-plan.md`): evalplus, math-verify, huggingface_hub, pyarrow, langdetect, nltk, absl-py, immutabledict, numpy, tqdm via pip, inside the venv only |
+
+Models downloaded for the evaluation (2026-10-26): `/opt/llms/ref/Qwen3.8-27B-UD-Q6_K.gguf` (unsloth, 22.0 GB,
+sha256 checked against Hugging Face, `SHA256SUMS` next to it).
 
 Repo-local git identity set with `git config user.name/user.email` (not global).
 
