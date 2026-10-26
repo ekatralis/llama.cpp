@@ -300,3 +300,18 @@ at the 16k budget.
 - Full medium run started 2026-10-26 17:22 (`run_all.sh '^[a-z0-9]+:'`, i.e. without the xhigh jobs).
 - xhigh runs queued behind it (`run_xhigh.sh <run_all pid>`): HumanEval+ / MBPP+ / MATH-500 / GSM8K / AIME at xhigh with
   the medium budgets, then LiveCodeBench at xhigh / 32k.
+
+### Change 2026-10-26 evening: runtime cuts (~5 days -> ~3 days)
+
+The full HumanEval+ run used ~1.5x the pilot's tokens per answer (973 vs 638), so the pilot-based totals were ~30% low
+and the whole plan came to ~5 days. Owner's decision, the xhigh vs medium comparison is kept in full:
+
+1. `bonsai-ptq1` dropped from the benchmarks: PTQ1_0 holds the same ternary weights as PQ2_0, and the fork gives the same
+   logits (1b: identical KLD / PPL vs Q6_K to 6 digits). Phase 1 still covers it (1a, CPU comparison, greedy).
+2. GSM8K dropped at both efforts (saturated; MATH-500 and AIME cover maths).
+3. IFEval 541 -> 270 prompts (seeded sample), 4. MMLU-Pro 700 -> 350 (25 per category, a subset of the 50).
+   `prep_cuts.py`; full sets kept as `prompts_full.jsonl`.
+
+Remaining jobs: `qwen-q3` and `bonsai-pq2`, medium: HumanEval+, MBPP+, IFEval, LiveCodeBench, retrieval 8k-100k
+(Bonsai also 128k-250k), LongBench v2, MMLU-Pro, MATH-500, AIME; xhigh: HumanEval+, MBPP+, MATH-500, AIME, then
+LiveCodeBench at 32k. Restarted 18:13; the 42 Bonsai HumanEval+ answers already written are reused.
