@@ -225,7 +225,10 @@ Decisions and changes against the plan above:
   (2025-02-15 .. 2025-04). Qwen3.8 is newer than these problems, so contamination is possible; it affects all three
   models alike (same base model), so the comparison holds but absolute scores may be flattering. The private tests are
   pickled in the dataset: decoded with an unpickler that refuses any global (plain strings only); all 175 decode.
-- **GPQA Diamond** is gated on Hugging Face (needs an account that accepted its terms): pending, needs a token.
+- **GPQA Diamond: skipped for now (owner's decision, 2026-10-26), possible later addition.** It is gated on Hugging
+  Face (`Idavidrein/gpqa`: accept the terms, then a read-only token). Ready to run once the CSV is in
+  `/opt/eval/data/gpqa/`: `prep_gpqa.py` (choices shuffled with a fixed seed), then `run_all.sh gpqa`
+  (`run_bench.sh` already has its settings: thinking on, budget 12k). `run_all.sh` skips it while the data is missing.
 - **IFEval** has 541 prompts (the file's last line has no newline).
 - **MMLU-Pro** zero-shot with the official "the answer is (X)" instruction; extraction as in the official script
   (answer-is pattern, then "Answer: X", then the last standalone letter); no random guess when nothing is found.
