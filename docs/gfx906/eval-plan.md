@@ -1,6 +1,7 @@
 # Evaluation plan: Qwen3.8 27B Q3_K_XL vs Ternary Bonsai 2 27B (gfx906, Radeon VII)
 
-Status: proposal, 2026-10-26. Nothing below has been run yet except the download of the reference model.
+Status: approved 2026-10-26 with the default choices; running. Implementation notes and changes made while setting
+it up are in "Implementation" at the end.
 
 Two questions:
 
@@ -187,3 +188,61 @@ comparison even if the run is stopped early. Order = priority.
 - Tier 2: **run after tier 1 and Phase 3** / skip / run before Phase 3.
 - Judge-based chat evaluation (MT-Bench, judged by me): **not planned** / add.
 - Q6_K reference on task benchmarks (tier 3): **not planned** / add (~12 h).
+
+## Implementation (2026-10-26)
+
+Code: `/opt/gfx906-tools/eval/` (not in git, like the other tools). Data: `/opt/eval/data/`, results:
+`/opt/eval/results/<benchmark>/<model>/{gen.jsonl, score.json}`, server logs: `/opt/eval/logs/`.
+
+Installed for this (also listed in README "Packages installed"): apt `python3.12-venv`, `python3-pip`; venv
+`/opt/eval/venv` with evalplus 0.3.1, math-verify 0.9.0, huggingface_hub, pyarrow, langdetect, nltk, absl-py,
+immutabledict, numpy, tqdm. Downloaded code: LiveCodeBench repo @ `28fef95` (only its 3 evaluation files are used),
+google-research `instruction_following_eval` @ `e6890f85` (4 files, read: text checks only). NLTK punkt data in
+`/opt/eval/nltk_data` (NLTK refuses group-writable dirs: `/opt/eval` is now `g-w`).
+
+| script | what |
+|---|---|
+| `serve.sh <model-id> <port> <ctx> <np> [args]` | llama-server for one model (q8_0 K/V, `--reasoning-format deepseek`, budget message), waits for ready |
+| `gen.py` | generation client: chat completions, N in flight, per-question seed (crc32 of benchmark:id), resumable JSONL |
+| `run_bench.sh <bench> <model-id> [limit]` | GPU lock + server + `gen.py` with that benchmark's settings |
+| `run_longctx.sh <model-id> <length>` | same for the long-context set (1 slot, ctx = length + 4096) |
+| `sandbox.sh` | code execution sandbox (see Phase 0) |
+| `prep_*.py` | prompts + gold answers per benchmark |
+| `score_evalplus.sh`, `score_lcb.sh` | scoring in the sandbox; `score_ifeval.py`, `score_simple.py`, `score_longctx.py` outside |
+| `phase1-kld.sh`, `phase1-greedy.sh`, `greedy-compare.py` | Phase 1 |
+| `summarize.py` | all scores with bootstrap 95% CIs, budget hits, tokens |
+
+Decisions and changes against the plan above:
+
+- **Thinking budget instead of a hard cap:** llama-server's per-request `reasoning_budget_tokens` ends the thinking
+  block at the budget and injects "Considering the limited time by the user, I have to give the solution based on the
+  thinking directly now." (the wording from the Qwen3 report), then the model writes its answer. `max_tokens` = budget
+  + 2-4k for the answer. Answers that hit the budget are counted per model (`budget_hit`); answers that still hit
+  `max_tokens` count as wrong (`cut`).
+- **Parallel slots:** 4 slots, unified K/V of 98,304 tokens (q8_0), so one long answer can use more than a quarter.
+  AIME uses 3 slots.
+- **LiveCodeBench:** the newest official release is v6 (problems Jan-Apr 2025, 175). Used: the 100 most recent
+  (2025-02-15 .. 2025-04). Qwen3.8 is newer than these problems, so contamination is possible; it affects all three
+  models alike (same base model), so the comparison holds but absolute scores may be flattering. The private tests are
+  pickled in the dataset: decoded with an unpickler that refuses any global (plain strings only); all 175 decode.
+- **GPQA Diamond** is gated on Hugging Face (needs an account that accepted its terms): pending, needs a token.
+- **IFEval** has 541 prompts (the file's last line has no newline).
+- **MMLU-Pro** zero-shot with the official "the answer is (X)" instruction; extraction as in the official script
+  (answer-is pattern, then "Answer: X", then the last standalone letter); no random guess when nothing is found.
+- **Maths** (MATH-500, GSM8K, AIME): "Please reason step by step, and put your final answer within \boxed{}.";
+  scored with `math-verify` (checked: `\dfrac` vs `\frac`, tuples, plain numbers).
+- **Long-context retrieval (3a), as built:** each document is a passage from Project Gutenberg novels (War and Peace,
+  Les Miserables, Moby Dick, Great Expectations, A Tale of Two Cities, Pride and Prejudice) with 65 inserted sentences;
+  18 questions per document: 10 single-value keys at depths 5%..95% (each with 12 other keys of the same form as
+  distractors), 3 four-value keys, 4 variable chains of 4 hops, and 1 aggregation question (most and second most
+  frequent of 8 items in 27 "Inventory log" lines; replaces the frequent-words task, so it can share the document).
+  Documents per length: 8k: 6, 32k: 4, 64k: 3, 100k: 2, 128k: 2, 192k: 1, 250k: 1 (the last three Bonsai only).
+  Actual prompt lengths are ~6% below the nominal ones (30,948 tokens for "32k"); reports use the actual counts.
+  Prompt cache reuse works on the hybrid model (checked): the first question of a 31k document took 101 s, each
+  next one 2.6 s (~516 tokens re-processed from the last checkpoint).
+- **LongBench v2 (3b):** moved to `zai-org/LongBench-v2`. The short subset needs ~5.4M prompt tokens per model
+  (~5-6 h each), so a stratified half is used: 93 questions (half of each domain x difficulty cell, seed 1234),
+  documents over ~92k tokens cut in the middle (2 of 93). Run shortest first.
+- **MTP check (1c):** the MTP verify step runs 3-token kernels, so its logits are not bit-identical to single-token
+  decoding; greedy text can differ after a near-tie. Reported as identical prompts and first differing character, like
+  the fork-vs-stock comparison.
