@@ -512,3 +512,6 @@ fork. Bonsai PQ2_0 on this branch, medium thinking effort, against Qwen3.8-27B-U
   PTQ1_0 gives the same logits as PQ2_0 (same ternary weights). MTP lossless up to rounding: draft 2 = draft 3, every
   split against no-MTP greedy text at a near-tie (top-2 probabilities within 0.02).
 - GPU time for the whole Bonsai run: ~30 h (Qwen ~38 h).
+
+Launch commands for the Bonsai configurations (longest context, MTP, evaluation) and what each option does:
+`docs/gfx906/server-configs.md` on branch `gfx906-qwen38` of the main fork.
