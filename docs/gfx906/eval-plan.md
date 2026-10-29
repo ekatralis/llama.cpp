@@ -318,3 +318,33 @@ and the whole plan came to ~5 days. Owner's decision, the xhigh vs medium compar
 Remaining jobs: `qwen-q3` and `bonsai-pq2`, medium: HumanEval+, MBPP+, IFEval, LiveCodeBench, retrieval 8k-100k
 (Bonsai also 128k-250k), LongBench v2, MMLU-Pro, MATH-500, AIME; xhigh: HumanEval+, MBPP+, MATH-500, AIME, then
 LiveCodeBench at 32k. Restarted 18:13; the 42 Bonsai HumanEval+ answers already written are reused.
+
+## Round 2 (2026-10-29): Gemma 4 31B, Gemma 4 26B-A4B, Muse Glimmer 30B
+
+Owner's choices: suite B, files matched to Qwen's memory footprint (~13 GB), no per-model Q6_K references.
+
+| id | file (unsloth, pinned revision) | size | bits/param | drafter |
+|---|---|---:|---:|---|
+| `gemma4-26b` | `gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf` (MoE, 25.2B total, 3.8B active) | 12.91 GB | ~4.1 | `mtp-gemma-4-26B-A4B-it.gguf` |
+| `glimmer-30b` | `Muse-Glimmer-30B-UD-Q3_K_XL.gguf` (dense, ~28B text) | 13.36 GB | ~3.8 | `dflash-kquant.gguf` (DFlash) |
+| `gemma4-31b` | `gemma-4-31B-it-Q3_K_S.gguf` (dense, 30.7B) | 13.21 GB | ~3.4 | `mtp-gemma-4-31B-it.gguf` |
+
+Files in `/opt/llms/new` with `SHA256SUMS` from the Hugging Face LFS ids. Footprint matching answers "best model for
+this 16 GB card"; Gemma 31B is squeezed hardest (UD-Q3_K_XL, 15.4 GB, leaves no room for context).
+
+Steps:
+
+1. **Setup and fit:** map medium / xhigh onto each chat template's own reasoning control (written down per model);
+   check that thinking is split from the answer and that the thinking budget works (neutral budget message); largest
+   context with q8_0 K/V, with and without the drafter.
+2. **Fork correctness:** KLD fork vs stock at ubatch 1 / 3 / 512 (f16 and q8_0 K/V, prose / code / docs) and greedy
+   text with and without speculative decoding. A model the fork gets wrong runs on stock, and the bug goes on the
+   tuning list.
+3. **Speed, untuned:** llama-bench pp512 / tg128 at depth 0 / 8k / 32k / deeper where it fits, fork and stock, q8_0 K/V;
+   llama-server throughput with 1 and 4 slots; with 1 slot also with the drafter (speed-up, acceptance); Qwen and Bonsai
+   re-measured with the same scripts; one rocprofv3 kernel profile per model for later tuning.
+4. **Benchmarks (suite B):** pilot (10 per benchmark), then everything at medium (HumanEval+, MBPP+, LiveCodeBench,
+   IFEval, MMLU-Pro, MATH-500, AIME, LongBench v2, retrieval up to each model's max context) plus xhigh on AIME and
+   LiveCodeBench at 32k. Same questions, seeds, budgets and scoring; each model's recommended sampling. Order:
+   `gemma4-26b`, `glimmer-30b`, `gemma4-31b`. Estimate ~3.5 days of GPU time.
+5. **Report:** new models and a speed section on the results page; docs.
