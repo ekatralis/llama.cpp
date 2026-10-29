@@ -491,3 +491,24 @@ Max context with q8_0 K/V (same method as above): PQ2_0 233,472 -> 253,952 (262,
 the main fork 98,304 -> 106,496. PTQ1_0 was already at the full 262,144. Not re-measured: PQ2_0 + MTP.
 
 KLD, direct vs copy path (PQ2_0, q8_0 K/V): ubatch 1 at the noise floor, ubatch 512 0.000124 (fp16 summation).
+
+## Evaluation (2026-10-29)
+
+Full results, method and fork correctness checks: `docs/gfx906/eval-results.md` on branch `gfx906-qwen38` of the main
+fork. Bonsai PQ2_0 on this branch, medium thinking effort, against Qwen3.8-27B-UD-Q3_K_XL on its own gfx906 branch:
+
+| benchmark | Bonsai PQ2_0 | Qwen Q3_K_XL |
+|---|---:|---:|
+| HumanEval+ / MBPP+ (plus) | 93.3 / 79.4 | 95.1 / 81.0 |
+| LiveCodeBench (newest 100) | 66.0 | 79.0 |
+| IFEval (prompt strict) | 88.1 | 89.3 |
+| MMLU-Pro / MATH-500 / AIME 2025 | 78.3 / 96.5 / 70.0 | 82.3 / 96.0 / 80.0 |
+| LongBench v2 | 73.1 | 65.6 |
+
+- At xhigh effort: AIME 90.0 (Qwen 96.7), LiveCodeBench with a 32k budget 71.0 (Qwen 80.0).
+- Long-context retrieval up to 250k: every planted fact found at every length; the multi-value and aggregation tasks
+  fall off past 100k.
+- Correctness: KLD vs stock 0.00013-0.00014 (PQ2_0), PTQ1_0 prompt path matches the CPU reference (stock 0.0033);
+  PTQ1_0 gives the same logits as PQ2_0 (same ternary weights). MTP lossless up to rounding: draft 2 = draft 3, every
+  split against no-MTP greedy text at a near-tie (top-2 probabilities within 0.02).
+- GPU time for the whole Bonsai run: ~30 h (Qwen ~38 h).
