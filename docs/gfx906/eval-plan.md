@@ -1,6 +1,6 @@
 # Evaluation plan: Qwen3.8 27B Q3_K_XL vs Ternary Bonsai 2 27B (gfx906, Radeon VII)
 
-Status: approved 2026-10-26 with the default choices; running. Implementation notes and changes made while setting
+Status: approved 2026-10-26 with the default choices; finished 2026-10-29, results in `eval-results.md`. Implementation notes and changes made while setting
 it up are in "Implementation" at the end.
 
 Two questions:
@@ -99,8 +99,11 @@ Two questions:
 
 ### 1c. Generation-level checks
 
-- **MTP is lossless:** greedy, 20 prompts x 512 tokens; output with MTP (draft 2 and 3) must equal output without
-  MTP, for `qwen-q3` and the Bonsai MTP model.
+- **MTP is lossless up to rounding:** greedy, 20 prompts x 512 tokens, with MTP (draft 2 and 3) and without, for
+  `qwen-q3` and the Bonsai MTP model. (Originally written as "must equal"; that is too strict. MTP verifies drafts in a
+  3-4 token batch, which adds in a different order than single-token generation, so greedy text can split at near-ties.
+  Result: draft 2 and draft 3 give identical text, and every split against no MTP is checked against the top-2
+  probabilities at that token, `greedy-probs.py`.)
 - **Fork vs stock greedy text:** the same 20 prompts on our build and the stock build. The point where the two first
   differ is reported (rounding makes them drift apart eventually; an early divergence on many prompts would be a red
   flag).

@@ -8,6 +8,14 @@ Goal: get the most performance out of an AMD Radeon VII (gfx906) running
   config (MTP speculative decoding, small-batch kernels); see "MTP plan" below
 - Git identity (repo-local only): Evangelos Katralis <vkatralis@gmail.com>
 
+## Evaluation (2026-10-29)
+
+Quality evaluation of `Qwen3.8-27B-UD-Q3_K_XL` (this branch) against Ternary Bonsai PQ2_0 (branch `gfx906-bonsai`),
+plus fork-vs-stock correctness checks: `eval-results.md` (results), `eval-plan.md` (plan and settings). In short:
+Qwen leads on LiveCodeBench (79% vs 66%), AIME and MMLU-Pro; the two are within ~2 points on HumanEval+, MBPP+, IFEval
+and MATH-500. The fork's logits stay within a few times stock's own batch-size noise, and MTP is lossless up to
+rounding (draft 2 = draft 3; every split against no-MTP greedy text is at a near-tie).
+
 ## Hardware / software
 
 | Item | Value |
