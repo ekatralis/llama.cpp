@@ -16,6 +16,8 @@ Qwen leads on LiveCodeBench (79% vs 66%), AIME and MMLU-Pro; the two are within 
 and MATH-500. The fork's logits stay within a few times stock's own batch-size noise, and MTP is lossless up to
 rounding (draft 2 = draft 3; every split against no-MTP greedy text is at a near-tie).
 
+Launch commands for every configuration used, with what each option does: `server-configs.md`.
+
 ## Hardware / software
 
 | Item | Value |
